@@ -58,12 +58,12 @@ sequenceDiagram
 
 | 順 | issue |
 | --- | --- |
-| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられない |
-| 2 | [#3](https://github.com/maimuzo/pace/issues/3) プランの文を1つずつ引用できない |
-| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を少ない呼び出しで回せない |
-| 4 | [#5](https://github.com/maimuzo/pace/issues/5) 決定の根拠を辿れない |
-| 5 | [#6](https://github.com/maimuzo/pace/issues/6) 循環論法と根拠切れを検出できない |
-| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴が書き手と人間に返らない |
-| 7 | [#8](https://github.com/maimuzo/pace/issues/8) 1行直したときに、何がやり直しになり何が残るか分からない |
-| 8 | [#9](https://github.com/maimuzo/pace/issues/9) PACE の効果が分からない |
-| 9 | [#10](https://github.com/maimuzo/pace/issues/10) continuo の側に、PACE を組み込む issue が無い（#9 の結果をオーナーが見て「動く」と判断してから） |
+| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられるようにする。なぜなら、どのリポジトリのプランにも同じ手順で PACE を回せるようにしたいからだ |
+| 2 | [#3](https://github.com/maimuzo/pace/issues/3) プランを文・表の行・コードの1行ごとに分けて引用できるようにする。なぜなら、根拠のグラフの全ての決定と前提が、プランの原文を指す必要があるからだ |
+| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を束にまとめて、少ない呼び出しで回せるようにする。なぜなら、subagent の呼び出し1回に約7万トークンの固定分がかかるからだ |
+| 4 | [#5](https://github.com/maimuzo/pace/issues/5) 決定ごとに、プランのどの前提からどう導いたかを辿れるようにする。なぜなら、根拠の無い決定を見つけるには、まず根拠の道筋を作る必要があるからだ |
+| 5 | [#6](https://github.com/maimuzo/pace/issues/6) 循環論法と根拠切れを、プラン全体で検出できるようにする。なぜなら、決定を1つずつ見ていると、互いを理由にし合う輪に気づけないからだ |
+| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴を、書き手が直すものと人間が決めるものに分けて返せるようにする。なぜなら、事実の穴は AI が直し、価値判断は人間に訊く必要があるからだ |
+| 7 | [#8](https://github.com/maimuzo/pace/issues/8) プランを1行直したときに、何がやり直しになったかを数えられるようにする。なぜなら、周を重ねる費用と、結果がキャッシュで揺れないことを確かめたいからだ |
+| 8 | [#9](https://github.com/maimuzo/pace/issues/9) 実際のプランで PACE の効果を測れるようにする。なぜなら、どこを作り込むかは、効果と負担を測ってから決めるからだ |
+| 9 | [#10](https://github.com/maimuzo/pace/issues/10) continuo の設計の流れで PACE を回せるようにする（continuo に issue を起票する）。なぜなら、計画を書いた直後に根拠の穴を潰せば、設計レビューの周と人間への往復が減るからだ（#9 の結果をオーナーが見て「動く」と判断してから） |

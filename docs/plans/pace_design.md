@@ -302,15 +302,15 @@ NEXT: continue
 
 | 順 | issue | 完了条件の要点 |
 | --- | --- | --- |
-| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられない | marketplace.json・plugin.json・SKILL.md・agent 2つ・`pace.py --version`（段ごとの版の一覧）。`claude plugin install pace@pace` で入り、skill から叩ける。README に入れ方と更新のコマンド |
-| 2 | [#3](https://github.com/maimuzo/pace/issues/3) プランの文を1つずつ引用できない | `init`（`.pace/.gitignore`・残すファイル・`shown.md` の初回・読めないときの `errors=1`）と分割（`code_line`・連番）。unittest |
-| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を少ない呼び出しで回せない | `next` の枠（束・検証・差し戻し3回・失敗したジョブ・キャッシュ）と分類 A/B・比較・裁定・ノード化。SKILL.md のループで、continuo の issue224_config_reload.md と issue134_136_140_blocked_notice.md の分類が、メインのセッションで回る |
-| 4 | [#5](https://github.com/maimuzo/pace/issues/5) 決定の根拠を辿れない | 候補の絞り込み・根拠付け（r1/r2）・2-gram の追加候補 |
-| 5 | [#6](https://github.com/maimuzo/pace/issues/6) 循環論法と根拠切れを検出できない | 輪を断つ反復・結合・`verify` |
-| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴が書き手と人間に返らない | 反論・`report`・`show`・`shown`、SKILL.md の周の回し方と決まり6つ。pace.py が守る性質5つがテストで成り立つ |
-| 7 | [#8](https://github.com/maimuzo/pace/issues/8) 1行直したときに、何がやり直しになり何が残るか分からない | やり直したジョブの数の記録と、キャッシュの有無で結果が一致するテスト |
-| 8 | [#9](https://github.com/maimuzo/pace/issues/9) PACE の効果が分からない | 評価用の6本（continuo の issue224・issue144・issue134_136_140・issue245、continuo の計画のコメント1本、continuo 以外の公開リポジトリのプラン1本。idea.md 12.4 の5種類に、H2 が1つの continuo の計画を足したもの）で回し、質問の周を1本以上通し、測った数を記録する。束・並列・周の上限を決め直す |
-| 9 | [#10](https://github.com/maimuzo/pace/issues/10) continuo の側に、PACE を組み込む issue が無い | #9 の結果をオーナーが見て「動く」と判断してから、continuo に issue を起票する |
+| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられるようにする。なぜなら、どのリポジトリのプランにも同じ手順で PACE を回せるようにしたいからだ | marketplace.json・plugin.json・SKILL.md・agent 2つ・`pace.py --version`（段ごとの版の一覧）。`claude plugin install pace@pace` で入り、skill から叩ける。README に入れ方と更新のコマンド |
+| 2 | [#3](https://github.com/maimuzo/pace/issues/3) プランを文・表の行・コードの1行ごとに分けて引用できるようにする。なぜなら、根拠のグラフの全ての決定と前提が、プランの原文を指す必要があるからだ | `init`（`.pace/.gitignore`・残すファイル・`shown.md` の初回・読めないときの `errors=1`）と分割（`code_line`・連番）。unittest |
+| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を束にまとめて、少ない呼び出しで回せるようにする。なぜなら、subagent の呼び出し1回に約7万トークンの固定分がかかるからだ | `next` の枠（束・検証・差し戻し3回・失敗したジョブ・キャッシュ）と分類 A/B・比較・裁定・ノード化。SKILL.md のループで、continuo の issue224_config_reload.md と issue134_136_140_blocked_notice.md の分類が、メインのセッションで回る |
+| 4 | [#5](https://github.com/maimuzo/pace/issues/5) 決定ごとに、プランのどの前提からどう導いたかを辿れるようにする。なぜなら、根拠の無い決定を見つけるには、まず根拠の道筋を作る必要があるからだ | 候補の絞り込み・根拠付け（r1/r2）・2-gram の追加候補 |
+| 5 | [#6](https://github.com/maimuzo/pace/issues/6) 循環論法と根拠切れを、プラン全体で検出できるようにする。なぜなら、決定を1つずつ見ていると、互いを理由にし合う輪に気づけないからだ | 輪を断つ反復・結合・`verify` |
+| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴を、書き手が直すものと人間が決めるものに分けて返せるようにする。なぜなら、事実の穴は AI が直し、価値判断は人間に訊く必要があるからだ | 反論・`report`・`show`・`shown`、SKILL.md の周の回し方と決まり6つ。pace.py が守る性質5つがテストで成り立つ |
+| 7 | [#8](https://github.com/maimuzo/pace/issues/8) プランを1行直したときに、何がやり直しになったかを数えられるようにする。なぜなら、周を重ねる費用と、結果がキャッシュで揺れないことを確かめたいからだ | やり直したジョブの数の記録と、キャッシュの有無で結果が一致するテスト |
+| 8 | [#9](https://github.com/maimuzo/pace/issues/9) 実際のプランで PACE の効果を測れるようにする。なぜなら、どこを作り込むかは、効果と負担を測ってから決めるからだ | 評価用の6本（continuo の issue224・issue144・issue134_136_140・issue245、continuo の計画のコメント1本、continuo 以外の公開リポジトリのプラン1本。idea.md 12.4 の5種類に、H2 が1つの continuo の計画を足したもの）で回し、質問の周を1本以上通し、測った数を記録する。束・並列・周の上限を決め直す |
+| 9 | [#10](https://github.com/maimuzo/pace/issues/10) continuo の設計の流れで PACE を回せるようにする（continuo に issue を起票する）。なぜなら、計画を書いた直後に根拠の穴を潰せば、設計レビューの周と人間への往復が減るからだ | #9 の結果をオーナーが見て「動く」と判断してから、continuo に issue を起票する |
 
 - 各 issue は、その計画で決めた細部をこの文書の該当の節へ書き足す。400行・1節50行の上限はこの版に当て、超えそうになったら節を分ける。
 - カンバンへの配置は、#1 の run でオーナーの指示（「全てice boxレーンに入れて、実装順序になるように並び替えておけ」）による例外として、AI が行った。この PR のレビューで表が変わったときは、同じ run の中で同じ置き方で直す。そのあとの並べ替えと、表から外れた issue を閉じることは、人間が決める。
