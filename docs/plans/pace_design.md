@@ -12,7 +12,7 @@
 
 **言いたいこと。**PACE は、continuo を知らない単独の Claude Code プラグインである。pace.py・SKILL.md・agent 2つで動く。
 pace.py はプランを書き換えず、直すべき箇所・人間への質問・次に何をするか・人間に見せるもの（`show.md`）をファイルに書く。
-SKILL.md は周を回し、書き手に3種類の文だけを書かせ、起動の終わりに `show.md` を人間に見せる。
+SKILL.md は周を回し、書き手に3種類の文だけを書かせ、起動の終わりに `show.md` を人間に見せる（`--no-ask` では見せずに呼び出し側へ返す）。
 
 - この文書が決めるのは骨組みまでである（プラグインの構成・書き手との境界・入出力のファイル・周の回し方）。段ごとの細部は、[実装計画](#13-実装計画) の各 issue の計画で決め、決めたものをこの文書へ書き足す。
 - continuo は、1つの issue の最初の計画について、人間確認の前に PACE を呼ぶ側である（[continuo と組むとき](#11-continuo-と組むとき)）。
@@ -30,17 +30,17 @@ SKILL.md は周を回し、書き手に3種類の文だけを書かせ、起動�
 ```text
 .claude-plugin/marketplace.json          {"name": "pace", "owner": {"name": "maimuzo"}, "plugins": [{"name": "pace", "source": "./plugins/pace"}]}
 plugins/pace/.claude-plugin/plugin.json  {"name": "pace", "description": "…", "author": {"name": "maimuzo"}}
-plugins/pace/skills/pace/SKILL.md        周の回し方。メインのセッションでインラインに動く。引数 --no-ask
+plugins/pace/skills/pace/SKILL.md        周の回し方。メインのセッションでインラインに動く。/pace:pace [--no-ask] <プランのパス>
 plugins/pace/agents/pace-worker.md       model: sonnet / tools: Read, Write。分類・根拠付け
 plugins/pace/agents/pace-judge.md        model: opus / tools: Read, Write。裁定・輪を断つ・反論
-plugins/pace/scripts/pace.py             --version / init / next / verify / report / show / shown（--version 以外はプランのパスを取る）
+plugins/pace/scripts/pace.py             --version（段ごとの版の一覧）/ init / next / verify / report / show / shown（--version 以外はプランのパスを取る）
 tests/                                   plugins/pace の外に置く（plugin のキャッシュに入れないため）
 ```
 
 | 決めたこと | 根拠 |
 | --- | --- |
 | 入れ方は `claude plugin marketplace add maimuzo/pace` と `claude plugin install pace@pace` | marketplace 名と plugin 名が同じ形には実例（`cloudflare@cloudflare`）がある |
-| 第三者の marketplace は既定で自動更新されないので、README に `claude plugin marketplace update pace` と `claude plugin update pace@pace` を書く | [continuo の docs/FAQ.md](https://github.com/maimuzo/continuo/blob/03a5fa3f/docs/FAQ.md) の「自動では新しくなりません」 |
+| 第三者の marketplace は既定で自動更新されないので、README に `claude plugin marketplace update pace` と `claude plugin update pace@pace` を書く | [continuo の docs/FAQ.md:3262](https://github.com/maimuzo/continuo/blob/03a5fa3f/docs/FAQ.md#L3262) の「自動では新しくなりません」 |
 | `plugin.json` に version を書かない | 書くと、上げ忘れたときに更新が入らず、同時に進む PR が版の行で衝突する。書かない plugin は commit の sha のディレクトリに入る |
 | skill を核にする | どの流れからでも呼べる |
 | agent に Bash を持たせない | 実行役がスクリプトを書いて済ませるのを道具の側で止める（[../idea.md:509](../idea.md#L509)） |
@@ -50,9 +50,9 @@ tests/                                   plugins/pace の外に置く（plugin �
 - agent の呼び名は `pace:pace-worker` と `pace:pace-judge` である（plugin の agent に名前空間が付く実例: `maimuzo-issue-manage:bug-reporter`）。
 - スクリプトは `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py"` で呼ぶ。展開されないときは、skill を読み込んだときに示される skill のディレクトリから `../../scripts/pace.py` を辿る。どちらにするかは [#2](https://github.com/maimuzo/pace/issues/2) で決める。
 
-**退けた案。**
-- **ExitPlanMode の hook を核にする**: 退けたのではなく、後から足す。[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている。hook から skill を促す形は、skill ができてから足せる（どこでループを動かすかは実装段階で決めてよい。[../idea.md:98](../idea.md#L98)）。
-- **version を書いて PR ごとに上げる**: 上の表の理由で採らない。
+**後から足す案。**ExitPlanMode の hook から skill を促す形。[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている。skill ができてから足せる（どこでループを動かすかは実装段階で決めてよい。[../idea.md:98](../idea.md#L98)）。
+
+**退けた案。**version を書いて PR ごとに上げる: 上の表の理由で採らない。
 
 ---
 
@@ -61,7 +61,7 @@ tests/                                   plugins/pace の外に置く（plugin �
 **言いたいこと。**pace.py はプランを書き換えず、人間にも訊かない。直すのと見せるのは、SKILL.md を読んだ書き手のセッションである。
 見せ方は SKILL.md の引数で選ぶ。既定ではチャットで見せ、`--no-ask` では見せずに呼び出し側へ返す。
 
-- 既定: `show.md` をチャットに出して止まる。
+- 既定: `show.md` をチャットに出し、`shown` を打ってから止まる。
 - `--no-ask`: `show.md` のパスと、shown を打つコマンド行（写しの sha256 を含む）を返して終わる。コマンド行にはスクリプトの絶対パスが入るので、呼び出し側はそれを公開の場に写さない。
 - SKILL.md はメインのセッションでインラインに動く（fork しない）。subagent は subagent を起動できないためである。
 - 書き手は束を必ず subagent へ渡す。`*.out.json` を自分で書かない（[pace.py が守る性質と SKILL.md の決まり](#8-pacepy-が守る性質と-skillmd-の決まり)）。
@@ -89,7 +89,7 @@ sequenceDiagram
     M->>H: show.md（チャットで）
     M->>S: pace.py shown docs/plans/impl/issue224_config_reload.md 9f2c…
     H-->>M: 「読み直しは安全側を重視する。差分の3行目の事実は違う」
-    M->>M: 回答を質問の文と組にして書き、違うと言われた文を消し、/pace:pace を起動し直す
+    M->>M: 回答を質問の文と組にして書き、違うと言われた文を消し、/pace:pace docs/plans/impl/issue224_config_reload.md を起動し直す
 ```
 
 **退けた案。**PACE の側で人間に訊く（issue のコメントへ書くなど）: 特定の流れを前提にすることになり、「pace は continuo を前提にしない」（オーナーの指示）に反する。
@@ -104,7 +104,7 @@ sequenceDiagram
 
 **退けた案。**
 - **別の文書の参照も入力にする**（[../idea.md:697-699](../idea.md#L697-L699) の指摘）: いまは採らない。参照は本文の文字（「continuo_design.md の 3-24」）で書かれることが多く、continuo の docs/plans から continuo_design.md へのリンクのうちアンカー付きは約4分の1しかない。解決には節番号の解析と巨大な節の扱いが要る。W2 に従い、[#9](https://github.com/maimuzo/pace/issues/9) で「別の文書に答えがある gap」の数を測ってから決める。
-- **前提に「人間の決定」の種類を足す**（[../idea.md:700-702](../idea.md#L700-L702)）: いまは採らない。中身で判定する規則が実データに合わず、照合しないと AI の書いた「人間はこう言った」が根っこになる。人間の回答は value の前提として自然文で書く（[pace.py が守る性質と SKILL.md の決まり](#8-pacepy-が守る性質と-skillmd-の決まり)）。
+- **前提に「人間の決定」の種類を足す**（[../idea.md:700-702](../idea.md#L700-L702)）: いまは採らない。中身で判定する規則が実データに合わず、照合しないと AI の書いた「人間はこう言った」が根っこになる。人間の回答は、質問の文と人間の原文を組にして自然文で書く（分類の段で、価値か要求の前提になる）（[pace.py が守る性質と SKILL.md の決まり](#8-pacepy-が守る性質と-skillmd-の決まり)）。
 
 ---
 
@@ -117,14 +117,16 @@ sequenceDiagram
 | --- | --- |
 | コードブロックの中身を1行1単位（`code_line`）にし、言語ごとの解析はしない | 言語の指定が無いブロックが375個ある（[../idea.md:683](../idea.md#L683)） |
 | 差し戻しを3回使い切ったジョブは「失敗したジョブ」として記録して先へ進む。その影響を受けた決定と単位は、fixes と questions から外し、`show.md` の「確かめられなかったもの」に出す | 1件の失敗で、ほかの結果を全部捨てない。失敗をプランの穴に見せない |
-| 止めるのは、プランを読めないこと（ファイルが無い・UTF-8 でない）だけ | 根拠の無い決定は、エラーではなく fixes の中身である |
+| エラー（errors）として数えるのは、プランを読めないこと（ファイルが無い・UTF-8 でない）だけ。プラン以外の失敗は pace.py が 0 以外で終わって知らせる | 根拠の無い決定は、エラーではなく fixes の中身である |
 | 根に届かない反証（idea.md 段7）は、エラーにせず、止めているものの側に出す | 直す先は止めているもので、設計ではない |
 | ジョブを束にして渡す | 呼び出し1回に約7万トークンの固定分がかかる（[../idea.md:601](../idea.md#L601)） |
-| レポートを fixes.md・questions.md・show.md に分け、切った辺は report.md に載せる | 書き手が直すもの・人間が決めるもの・人間に見せるものを分ける |
+| レポートを fixes.md・questions.md に分け、人間に見せるものは `show` が show.md にまとめる。切った辺は report.md に載せる | 書き手が直すもの・人間が決めるもの・人間に見せるものを分ける |
 | 要求の gap を、AI が直す側から人間に訊く側へ移す | 書き手が要求を自分で作ると、それが根っこになる |
-| 周の判定（NEXT の行）を pace.py に置く | 周回の制御は機械が行う（[../idea.md:311](../idea.md#L311)） |
+| 周の判定（NEXT の行）を pace.py に置き、上限を最後に見せてから3周にする | 周回の制御は機械が行う（[../idea.md:311](../idea.md#L311)） |
+| 判定役（裁定・輪を断つ・反論）を opus に、ほかを sonnet にする（idea.md は「既定のモデル」） | 呼び出し側の設定に左右されないようにする（[配り方とプラグインの形](#2-配り方とプラグインの形)） |
+| 実行役（agent）に Bash を持たせない | スクリプトを書いて済ませるのを道具の側で止める |
 | キャッシュの鍵に、段の指示文の sha256 も入れる | 指示文を変えて段の版を上げ忘れても、古い答えを使い回さない |
-| 作業ディレクトリを引数で取らず、プランの隣に置く | どのコマンドもプランのパスだけで動く |
+| 作業ディレクトリを引数で取らず、プランの隣に置き、`.gitignore` を書く | どのコマンドもプランのパスだけで動く。利用者のリポジトリへ中間のファイルを入れない |
 | CLI を `--version`・`init`・`next`・`verify`・`report`・`show`・`shown` にし、`rounds.jsonl`・`shown.md`・`show_snapshot.md` を足す | 書き手との境界と周の回し方 |
 
 - 単位 ID の重複は、idea.md のとおり連番にする。
@@ -156,7 +158,7 @@ NEXT: continue
 ```
 
 ```json
-{"round": 1, "plan_sha256": "9f2c…", "units": 96, "decisions": 50, "rooted": 2, "needs_gap": 48, "gaps": {"fact": 40, "requirement": 11, "value": 12}, "defeaters": {"accepted": 17, "refuted": 6, "needs_human": 4}, "failed_jobs": 1}
+{"round": 1, "plan_sha256": "9f2c…", "units": 96, "decisions": 50, "rooted": 2, "needs_gap": 48, "gaps": {"fact": 40, "requirement": 11, "value": 12}, "defeaters": {"accepted": 17, "refuted": 6, "needs_human": 4}, "failed_jobs": 1, "fixes": 12, "questions": 4}
 ```
 
 ```markdown
@@ -164,7 +166,7 @@ NEXT: continue
   - 足りない事実: ファイル監視・SIGHUP を退ける理由がプランに無い（G_D_2e8b33e5_1_g2、fact）
 ```
 
-（上から、`report` の最後の2行・`rounds.jsonl` の1行・`fixes.md` の1項目。数は [../idea.md:557-570](../idea.md#L557-L570) の値）
+（上から、`report` の最後の2行・`rounds.jsonl` の1行・`fixes.md` の1項目。`rounds.jsonl` の決定・gap・反論の数は [../idea.md:557-570](../idea.md#L557-L570) の値で、PACE-STATUS の数は形を示すための例。fixes と questions を何の単位で数えるかは [#7](https://github.com/maimuzo/pace/issues/7) で決める）
 
 ---
 
@@ -194,7 +196,7 @@ NEXT: continue
 
 **退けた案。**
 - **周の終わりを書き手の申告で決める**: [../idea.md:311](../idea.md#L311) は周回の制御を機械に置いている。同じ入力でも周の数が変わり、測った値の再現性も失う。
-- **起動のたびに単位を控え、それに無い前提を「後から足された」として出す**: 起動し直すと、見せていない書き足しが基準に入る。見せた記録を `shown` でしか進めない形（次の節）に替えた。
+- **起動のたびに単位を控え、それに無い前提を「後から足された」として出す**: 起動し直すと、見せていない書き足しが基準に入る。見せた記録は `shown` でしか進めない（次の節）。
 
 ---
 
@@ -217,7 +219,7 @@ NEXT: continue
 
    価値や要求の理由が要る fixes と、確かめられない事実は、書かずに注記で人間に訊く。
 2. 秘密・個人の絶対パス・公開してよいか分からない中身は、プランにも注記にも書かない。そういう出どころしかない事実は書かずに、「出どころを伏せた」と添えて注記で訊く。
-3. `show.md` の境目の行より前（pace.py が書いた部分）は、削りも書き換えもしない。
+3. `show.md` の境目の行より前（pace.py が書いた部分）は、削りも書き換えもせず、既定の起動ではその全部を見せる。
 4. `NEXT: show` のあとは、その起動の中ではプランを直さない。
 5. `shown` は人間に見せたあとにだけ打つ。既定の起動では、チャットに出した時点を「見せた」とする。
 6. 束は必ず subagent に渡し、`*.out.json` を自分で書かない。
@@ -281,14 +283,14 @@ NEXT: continue
 
 ## 12. 残っている論点
 
-**言いたいこと。**#1 の設計レビューの最後の周に残った MEDIUM と LOW は、直さずに、受け持つ issue の計画で決める。各 issue の本文の「設計レビューで残った論点」にも同じものを書いた。
+**言いたいこと。**次の論点は、受け持つ issue の計画で決める。各 issue の本文の「設計レビューで残った論点」にも同じものがある。
 
 | 受け持つ issue | 論点 |
 | --- | --- |
-| [#2](https://github.com/maimuzo/pace/issues/2) | 判定役の `model: opus` が利用者の環境で使えるか、使えないときの差し替え（idea.md 2.6 の差し替え可能） |
+| [#2](https://github.com/maimuzo/pace/issues/2) | subagent の Write と pace.py の Bash で、権限の確認が周ごとに出ないか（`allowed-tools`。#2 の決めることにもある）。判定役の `model: opus` が利用者の環境で使えるか、使えないときの差し替え（idea.md 2.6 の差し替え可能） |
 | [#3](https://github.com/maimuzo/pace/issues/3) | 同じディレクトリに拡張子だけが違う同名のプランがあると、作業ディレクトリがぶつかる |
 | [#4](https://github.com/maimuzo/pace/issues/4) | `*.out.json` を書かなかったジョブを試行に数えるか。キャッシュの鍵に agent の定義やモデルの別名が入らないこと |
-| [#7](https://github.com/maimuzo/pace/issues/7) | show.md のコードブロックがプランの中の ``` で閉じる。errors のときに古い show_snapshot.md が残る。「最後に見せてから何周か」と「初回」を判定する記録の置き場所。`--no-ask` のときの決まり3と伏せ処理の上下・0 以外で終わったときに返すもの。決まり4の範囲・注記の問いと質問の重なり・show.md の中のパスの基準。init が `NEXT: show` を出したときの分かれ道・停止の条件の書き分け・性質4と5の show.md の形 |
+| [#7](https://github.com/maimuzo/pace/issues/7) | show.md のコードブロックがプランの中の ``` で閉じる。errors のときに古い show_snapshot.md が残る。「最後に見せてから何周か」と「初回」を判定する記録の置き場所。`--no-ask` のときの決まり3と伏せ処理の上下・0 以外で終わったときに返すもの。決まり4の範囲・注記の問いと質問の重なり・show.md の中のパスの基準。init が `NEXT: show` を出したときの分かれ道・停止の条件の書き分け・性質4と5の show.md の形。境目の行の形と、show.md・questions.md・report.md・`--no-ask` が返すものの見本。決まり3・4を pace.py で確かめるか（境目より前の sha256 など） |
 | [#9](https://github.com/maimuzo/pace/issues/9) | 「公開してよいか分からない中身は書かない」で質問が増えすぎないか。限界の節のうち、作り込むものの判断 |
 | [#10](https://github.com/maimuzo/pace/issues/10) | `--no-ask` で返すものを公開のコメントへ写すときの伏せ方 |
 
@@ -300,15 +302,15 @@ NEXT: continue
 
 | 順 | issue | 完了条件の要点 |
 | --- | --- | --- |
-| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられない | marketplace.json・plugin.json・SKILL.md・agent 2つ・`pace.py --version`。`claude plugin install pace@pace` で入り、skill から叩ける。README に入れ方と更新のコマンド |
+| 1 | [#2](https://github.com/maimuzo/pace/issues/2) PACE を Claude Code のプラグインとして入れられない | marketplace.json・plugin.json・SKILL.md・agent 2つ・`pace.py --version`（段ごとの版の一覧）。`claude plugin install pace@pace` で入り、skill から叩ける。README に入れ方と更新のコマンド |
 | 2 | [#3](https://github.com/maimuzo/pace/issues/3) プランの文を1つずつ引用できない | `init`（`.pace/.gitignore`・残すファイル・`shown.md` の初回・読めないときの `errors=1`）と分割（`code_line`・連番）。unittest |
-| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を少ない呼び出しで回せない | `next` の枠（束・検証・差し戻し3回・失敗したジョブ・キャッシュ）と分類 A/B・比較・裁定・ノード化。SKILL.md のループで分類まで回る |
+| 3 | [#4](https://github.com/maimuzo/pace/issues/4) AI に頼む仕事を少ない呼び出しで回せない | `next` の枠（束・検証・差し戻し3回・失敗したジョブ・キャッシュ）と分類 A/B・比較・裁定・ノード化。SKILL.md のループで、continuo の issue224_config_reload.md と issue134_136_140_blocked_notice.md の分類が、メインのセッションで回る |
 | 4 | [#5](https://github.com/maimuzo/pace/issues/5) 決定の根拠を辿れない | 候補の絞り込み・根拠付け（r1/r2）・2-gram の追加候補 |
 | 5 | [#6](https://github.com/maimuzo/pace/issues/6) 循環論法と根拠切れを検出できない | 輪を断つ反復・結合・`verify` |
-| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴が書き手と人間に返らない | 反論・`report`・`show`・`shown`、SKILL.md の周の回し方。pace.py が守る性質5つがテストで成り立つ |
+| 6 | [#7](https://github.com/maimuzo/pace/issues/7) 根拠の穴が書き手と人間に返らない | 反論・`report`・`show`・`shown`、SKILL.md の周の回し方と決まり6つ。pace.py が守る性質5つがテストで成り立つ |
 | 7 | [#8](https://github.com/maimuzo/pace/issues/8) 1行直したときに、何がやり直しになり何が残るか分からない | やり直したジョブの数の記録と、キャッシュの有無で結果が一致するテスト |
-| 8 | [#9](https://github.com/maimuzo/pace/issues/9) PACE の効果が分からない | 評価用の6本で回し、質問の周を1本以上通し、測った数を記録する。束・並列・周の上限を決め直す |
+| 8 | [#9](https://github.com/maimuzo/pace/issues/9) PACE の効果が分からない | 評価用の6本（continuo の issue224・issue144・issue134_136_140・issue245、continuo の計画のコメント1本、continuo 以外の公開リポジトリのプラン1本。idea.md 12.4 の5種類に、H2 が1つの continuo の計画を足したもの）で回し、質問の周を1本以上通し、測った数を記録する。束・並列・周の上限を決め直す |
 | 9 | [#10](https://github.com/maimuzo/pace/issues/10) continuo の側に、PACE を組み込む issue が無い | #9 の結果をオーナーが見て「動く」と判断してから、continuo に issue を起票する |
 
 - 各 issue は、その計画で決めた細部をこの文書の該当の節へ書き足す。400行・1節50行の上限はこの版に当て、超えそうになったら節を分ける。
-- 表の順序や件数が変わったら、カンバンも同じ置き方（Ice Box の末尾へ順に置く。既存の item は動かさない）で直し、表から外れた issue は理由を書いて閉じる。
+- カンバンへの配置は、#1 の run でオーナーの指示（「全てice boxレーンに入れて、実装順序になるように並び替えておけ」）による例外として、AI が行った。この PR のレビューで表が変わったときは、同じ run の中で同じ置き方で直す。そのあとの並べ替えと、表から外れた issue を閉じることは、人間が決める。
