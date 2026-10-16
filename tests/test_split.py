@@ -210,11 +210,14 @@ class SpeedTest(unittest.TestCase):
     def test_large_paragraph_is_not_quadratic(self):
         import time
         start = time.monotonic()
-        split("。\n".join(["文"] * 20000) + "\n" + "`a`**" * 20000)
-        split("a" + "*" * 400000 + "\nb")
-        split("# a" + " " * 20000 + "b")
-        # 2乗の版では同じ入力で十数秒かかる。線形の版は1秒に届かない
-        self.assertLess(time.monotonic() - start, 10.0)
+        split("。\n".join(["文"] * 40000))
+        split("`a`**" * 40000)
+        split("a" + "*" * 1600000 + "\nb")
+        split("# a" + " " * 80000 + "b")
+        split("".join("`" * k + " " for k in range(400, 1, -1)) + "`a` " * 100000)
+        # 2乗の版では、4万行の段落で10秒、`a`** の4万回で38秒、* の160万個で8秒、
+        # 8万の空白の見出しで15秒かかった（Python 3.9.6）。線形の版は5つ合わせて1秒に届かない
+        self.assertLess(time.monotonic() - start, 5.0)
 
 
 class SentenceTest(unittest.TestCase):

@@ -38,7 +38,10 @@ class InitTest(unittest.TestCase):
         self.assertEqual((self.pace / ".gitignore").read_text(), "*\n")
         self.assertEqual(json.loads((self.work / "source.json").read_text()), {"plan_file": "plan.md"})
         self.assertEqual((self.work / "plan.md").read_bytes(), self.plan.read_bytes())
-        units = [json.loads(l) for l in (self.work / "units.jsonl").read_text(encoding="utf-8").splitlines()]
+        # 1行1単位。splitlines() は U+2028 なども行の終わりにするので、"\n" だけで分ける
+        lines = (self.work / "units.jsonl").read_text(encoding="utf-8").split("\n")
+        self.assertEqual(lines[-1], "")
+        units = [json.loads(l) for l in lines[:-1]]
         self.assertEqual([(u["kind"], u["text"]) for u in units], [("heading", "題"), ("sentence", "本文。")])
         self.assertEqual((self.work / "shown.md").read_bytes(), self.plan.read_bytes())
 
@@ -86,6 +89,8 @@ class InitTest(unittest.TestCase):
             r = self.init(target)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, UNREADABLE, ""), target)
         self.assertFalse(self.pace.exists())
+        # ディレクトリをプランとして渡すと、作業ディレクトリは親の .pace/ の下になるはずだった
+        self.assertFalse((self.dir.parent / ".pace" / self.dir.name).exists())
 
     def test_unreadable_plan_keeps_other_plans_workdir(self):
         self.init()
@@ -167,6 +172,7 @@ class InitTest(unittest.TestCase):
             os.chmod(str(self.pace), 0o700)
         self.assertEqual(r.returncode, 1)
         self.assertIn("書けませんでした", r.stderr)
+        self.assertNotIn(".tmp", r.stderr)
 
     def test_multi_dot_name(self):
         plan = self.dir / "a.b.md"
@@ -208,7 +214,42 @@ class InitTest(unittest.TestCase):
         r = self.init(loop)
         self.assertEqual((r.returncode, r.stdout), (0, UNREADABLE))
 
-    def test_source_json_that_is_not_a_regular_file(self):
+    def test_source_json_that_is_a_symlink(self):
+        self.init()
+        source = self.work / "source.json"
+        outside = self.dir / "outside.json"
+        outside.write_text('{"plan_file": "plan.md"}')
+        source.unlink()
+        os.symlink(str(outside), str(source))
+        r = self.init()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ふつうのファイルではありません", r.stderr)
+
+    def test_source_json_that_is_too_deep(self):
+        self.init()
+        (self.work / "source.json").write_text("[" * 100000 + "]" * 100000)
+        r = self.init()
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_plan_copies_keep_plan_mode(self):
+        os.chmod(str(self.plan), 0o600)
+        self.init()
+        for name in ("plan.md", "shown.md"):
+            self.assertEqual(os.stat(str(self.work / name)).st_mode & 0o777, 0o600, name)
+
+    @unittest.skipIf(os.geteuid() == 0, "root は権限を無視する")
+    def test_unenterable_pace_dir_is_failure_without_traceback(self):
+        self.pace.mkdir()
+        os.chmod(str(self.pace), 0o000)
+        try:
+            r = self.init()
+        finally:
+            os.chmod(str(self.pace), 0o700)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_source_json_that_is_a_fifo(self):
         self.init()
         source = self.work / "source.json"
         source.unlink()
@@ -216,11 +257,6 @@ class InitTest(unittest.TestCase):
         r = subprocess.run([sys.executable, str(PACE), "init", str(self.plan)], capture_output=True, text=True,
                            timeout=10)
         self.assertEqual(r.returncode, 1)
-        source.unlink()
-        source.write_text("[" * 100000 + "]" * 100000)
-        r = self.init()
-        self.assertEqual(r.returncode, 1)
-        self.assertNotIn("Traceback", r.stderr)
 
     def test_fifo_is_unreadable(self):
         fifo = self.dir / "pipe.md"

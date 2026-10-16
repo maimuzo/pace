@@ -89,17 +89,26 @@ def strip_closing_hashes(title):
 def code_spans(text):
     """backtick で囲んだ範囲を [(始まり, 終わり)] で返す。閉じの無い並びがあれば ok は False。"""
     runs = [(m.start(), m.end()) for m in re.finditer(r"`+", text)]
+    # 幅ごとに並びの番号を持ち、次の同じ幅の並びを先頭から引く（後ろを毎回なめない）
+    by_width = {}
+    for k, (start, end) in enumerate(runs):
+        by_width.setdefault(end - start, []).append(k)
+    heads = {w: 0 for w in by_width}
     spans = []
     ok = True
     i = 0
     while i < len(runs):
         start, end = runs[i]
         width = end - start
-        for j in range(i + 1, len(runs)):
-            if runs[j][1] - runs[j][0] == width:
-                spans.append((start, runs[j][1]))
-                i = j + 1
-                break
+        same = by_width[width]
+        h = heads[width]
+        while h < len(same) and same[h] <= i:
+            h += 1
+        heads[width] = h
+        if h < len(same):
+            j = same[h]
+            spans.append((start, runs[j][1]))
+            i = j + 1
         else:
             ok = False
             i += 1
@@ -436,14 +445,17 @@ def current_umask():
     return mask
 
 
-def write_atomic(path, data):
-    """同じディレクトリの一時ファイルへ書き切ってから差し替える。既にあるファイルの権限は写す。"""
+def write_atomic(path, data, new_mode=None):
+    """同じディレクトリの一時ファイルへ書き切ってから差し替える。
+
+    既にあるファイルの権限は写す。新しく作るときは new_mode（無ければ umask の既定）にする。
+    """
     try:
         mode = path.stat().st_mode & 0o7777 if not path.is_symlink() else None
     except FileNotFoundError:
         mode = None
     if mode is None:
-        mode = 0o666 & ~current_umask()
+        mode = new_mode if new_mode is not None else 0o666 & ~current_umask()
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
@@ -482,9 +494,14 @@ def init(plan_arg):
         return 0
     data, text = read
     pace_dir, work = workdir_for(plan)
-    check_dir(pace_dir)
-    check_dir(work)
-    check_owner(plan, work)
+    try:
+        check_dir(pace_dir)
+        check_dir(work)
+        check_owner(plan, work)
+        # プランの写しは、元のプランの権限で作る（0600 のプランを他の利用者に読ませない）
+        plan_mode = plan.stat().st_mode & 0o777
+    except OSError as e:
+        raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     try:
         source = (json.dumps({"plan_file": plan.name}, ensure_ascii=False) + "\n").encode("utf-8")
     except UnicodeEncodeError:
@@ -496,13 +513,17 @@ def init(plan_arg):
         work.mkdir(exist_ok=True)
         write_atomic(work / "source.json", source)
         clear_workdir(work)
-        write_atomic(work / "plan.md", data)
+        write_atomic(work / "plan.md", data, plan_mode)
         lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
         write_atomic(work / "units.jsonl", lines.encode("utf-8"))
         if not (work / "shown.md").exists():
-            write_atomic(work / "shown.md", data)
+            write_atomic(work / "shown.md", data, plan_mode)
     except OSError as e:
-        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
+        failed = Path(e.filename) if e.filename else work
+        if failed.name.startswith(".") and failed.name.endswith(".tmp"):
+            # 一時ファイルは作られていないことがあるので、それを置くディレクトリを指す
+            failed = failed.parent
+        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, failed))
     print("units=%d" % len(units))
     return 0
 
