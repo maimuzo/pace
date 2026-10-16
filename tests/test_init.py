@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -246,6 +247,21 @@ class InitTest(unittest.TestCase):
         self.assertEqual(os.stat(str(self.pace / ".gitignore")).st_mode & 0o777, 0o600)
         for path in (self.pace, self.work):
             self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o700, path)
+
+    def test_mode_does_not_depend_on_umask(self):
+        # 持ち主のビットを消す umask でも、ファイルは 0600・ディレクトリは 0700 で作り、壊れた権限を残さない
+        for mask in (0o400, 0o200, 0o100, 0o077):
+            with self.subTest(umask=oct(mask)):
+                if self.pace.exists():
+                    shutil.rmtree(str(self.pace))
+                os.umask(mask)
+                r = self.init()
+                os.umask(0o022)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                for path in (self.pace, self.work):
+                    self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o700, path)
+                for name in ("plan.md", "units.jsonl", "shown.md", "source.json"):
+                    self.assertEqual(os.stat(str(self.work / name)).st_mode & 0o777, 0o600, name)
 
     def test_kept_symlink_is_not_followed(self):
         # shown.md が symlink なら、何を指していても触らない

@@ -268,7 +268,7 @@ NEXT: continue
 
 - 場所: `<プランと同じディレクトリ>/.pace/<プランのファイル名の拡張子を除いたもの>/`（例 `docs/plans/impl/.pace/issue224_config_reload/`）。中の構成は [../idea.md:484-498](../idea.md#L484-L498) の表に、上の節で足したファイルを加えたもの。
 - `init` は、プランを読めて作業ディレクトリを確かめたあと（下の順の5）に、`<プランと同じディレクトリ>/.pace/.gitignore`（中身は `*` の1行）を書く。`git status --porcelain` は無視されたファイルを出さないので、commit に入らず、worktree の片付けも止まらない。
-- `init` は `cache/`・`rounds.jsonl`・`shown.md`・`show_snapshot.md` を残し、ほかを作り直す（P5 とキャッシュの両立。[../idea.md:69](../idea.md#L69)・[../idea.md:316](../idea.md#L316)）。作り直しで書くのは `plan.md`（プランのバイトの写し）・`units.jsonl`・`source.json`（元のプランのファイル名。`design.markdown` なら `{"plan_file": "design.markdown"}`。これも残す）で、`shown.md` は無いときだけプランの写しで作る。`.pace/` の中は、`init` を打った利用者だけが読み書きする（ファイルは umask に依らず 0600、`.pace/` と作業ディレクトリは 0700。ディレクトリには umask が当たるので、持ち主のビットを消す umask では中に書けず、`init` は 1 で終わる）。プランの中身を他の利用者に読ませないためで、プランの権限には合わせない。一時ファイルの権限は、パスでなく開いたファイルに付ける。既にあるファイル（`.gitignore`・`source.json`）は、いまの権限を写す。symlink の `shown.md` は、何を指していても触らない。
+- `init` は `cache/`・`rounds.jsonl`・`shown.md`・`show_snapshot.md` を残し、ほかを作り直す（P5 とキャッシュの両立。[../idea.md:69](../idea.md#L69)・[../idea.md:316](../idea.md#L316)）。作り直しで書くのは `plan.md`（プランのバイトの写し）・`units.jsonl`・`source.json`（元のプランのファイル名。`design.markdown` なら `{"plan_file": "design.markdown"}`。これも残す）で、`shown.md` は無いときだけプランの写しで作る。`.pace/` の中は、`init` を打った利用者だけが読み書きする（新しく作るファイルは 0600、`.pace/` と作業ディレクトリは 0700 に、umask に依らず揃える）。プランの中身を他の利用者に読ませないためで、プランの権限には合わせない。一時ファイルの権限は、パスでなく開いたファイルに付ける。既にあるファイル（`.gitignore`・`source.json`）は、いまの権限を写す。symlink の `shown.md` は、何を指していても触らない。
 - キャッシュ無しで測るときは、`cache/` を空にしてから回す。
 
 **`init` の判定の順（[#3](https://github.com/maimuzo/pace/issues/3)）。**作業ディレクトリの中身を変えるのは、プランを読めて、そこがいまのプランのものと確かめたあとだけにする。

@@ -37,8 +37,8 @@ KEEP = frozenset({"cache", "rounds.jsonl", "shown.md", "show_snapshot.md", "sour
 UNREADABLE_STATUS = "PACE-STATUS: errors=1 failed_jobs=0 fixes=0 questions=0"
 
 # .pace/ の中は、init を打った利用者だけが読み書きする（プランの中身を他の利用者に読ませない）。
-# ファイルは umask に依らず 0600 に揃える。ディレクトリは mkdir が umask を当てるので、持ち主のビットを
-# 消す umask（0o100・0o200・0o400 など）では中に書けず、init は 1 で終わる
+# 新しく作るファイルは 0600、ディレクトリは 0700 に、umask に依らず揃える（持ち主のビットを消す umask で
+# 作っても、壊れた権限のディレクトリを残さない）
 PRIVATE_FILE = 0o600
 PRIVATE_DIR = 0o700
 
@@ -495,6 +495,15 @@ def write_atomic(path, data, new_mode):
         raise
 
 
+def make_private_dir(path):
+    """ディレクトリを作り、新しく作ったときだけ umask に依らず 0700 にする。既にあるものは変えない。"""
+    try:
+        os.mkdir(str(path), PRIVATE_DIR)
+    except FileExistsError:
+        return
+    os.chmod(str(path), PRIVATE_DIR)
+
+
 def clear_workdir(work):
     """作業ディレクトリの直下のうち、残すもの以外を消す。symlink は先を辿らずにリンクだけを消す。"""
     with os.scandir(str(work)) as it:
@@ -529,9 +538,9 @@ def init(plan_arg):
         raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     units = split_units(text)
     try:
-        pace_dir.mkdir(mode=PRIVATE_DIR, exist_ok=True)
+        make_private_dir(pace_dir)
         write_atomic(pace_dir / ".gitignore", b"*\n", PRIVATE_FILE)
-        work.mkdir(mode=PRIVATE_DIR, exist_ok=True)
+        make_private_dir(work)
         write_atomic(work / "source.json", source, PRIVATE_FILE)
         clear_workdir(work)
         write_atomic(work / "plan.md", data, PRIVATE_FILE)
