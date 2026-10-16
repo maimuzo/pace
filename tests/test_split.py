@@ -222,15 +222,17 @@ class SpeedTest(unittest.TestCase):
 
     def test_large_inputs_are_not_quadratic(self):
         # 入力ごとに、大きさを2倍にしたときの時間の伸びを比べる。線形なら約2倍、2乗なら約4倍になるので、
-        # 機の速さに依らず見分けられる。2乗の書き方をしていた前の版（0a50e2f・f0a20de）では、このテストが
-        # 落ちることを確かめた（** で終わる行が 0.63秒 → 2.14秒、閉じない backtick が 0.59秒 → 2.35秒。Python 3.9.6）
+        # 機の速さに依らず見分けられる。2乗の書き方をしていた前の版（f0a20de^・f0a20de・0a50e2f）では、このテストが
+        # 落ちることを確かめた（行末の * が 2.2秒 → 8.6秒、閉じない backtick が 0.57秒 → 2.26秒、
+        # ** で終わる行が 4.5秒 → 16.9秒。Python 3.9.6）
         builders = [
             ("段落", lambda n: "。\n".join(["文"] * n)),
             ("backtick と **", lambda n: "`a`**" * n),
             ("行末の *", lambda n: "a" + "*" * (40 * n) + "\nb"),
             ("見出しの空白", lambda n: "# a" + " " * (2 * n) + "b"),
+            # 閉じない並びの幅の数と、閉じた並びの数を、どちらも n に比例させる（本文は2倍より少し長くなる）
             ("閉じない backtick", lambda n: "".join("`" * k + " " for k in range(n // 100, 1, -1)) + "`a` " * n),
-            ("** で終わる行", lambda n: "a**\n" * (5 * n)),
+            ("** で終わる行", lambda n: "a**\n" * (15 * n)),
             ("深い引用", lambda n: ">" * (20 * n) + " x"),
         ]
         for name, build in builders:

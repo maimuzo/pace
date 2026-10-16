@@ -237,67 +237,29 @@ class InitTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("Traceback", r.stderr)
 
-    def test_plan_copies_keep_plan_mode(self):
-        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限を持ち主のほかには広げない
-        os.chmod(str(self.plan), 0o600)
+    def test_pace_dir_is_private(self):
+        # .pace/ の中は、init を打った利用者だけが読み書きする。プランが 0644 でも他の利用者に読ませない
+        os.chmod(str(self.plan), 0o644)
         self.init()
-        for name in ("plan.md", "shown.md", "units.jsonl"):
+        for name in ("plan.md", "shown.md", "units.jsonl", "source.json"):
             self.assertEqual(os.stat(str(self.work / name)).st_mode & 0o777, 0o600, name)
+        self.assertEqual(os.stat(str(self.pace / ".gitignore")).st_mode & 0o777, 0o600)
         for path in (self.pace, self.work):
             self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o700, path)
 
-    def test_mode_follows_umask(self):
-        os.umask(0o077)
-        self.init()
-        self.assertEqual(os.stat(str(self.work / "units.jsonl")).st_mode & 0o777, 0o600)
-        self.assertEqual(os.stat(str(self.pace)).st_mode & 0o777, 0o700)
-
-    def test_group_shared_plan_keeps_group_access(self):
-        os.umask(0o002)
-        os.chmod(str(self.plan), 0o664)
-        self.init()
-        self.assertEqual(os.stat(str(self.work / "units.jsonl")).st_mode & 0o777, 0o664)
-        self.assertEqual(os.stat(str(self.work)).st_mode & 0o777, 0o775)
-        # .pace/ には group の書く権限を渡さない（別のプランの作業ディレクトリを差し替えさせない）
-        self.assertEqual(os.stat(str(self.pace)).st_mode & 0o777, 0o755)
-
-    def test_plan_without_owner_bits_still_gives_owner_access(self):
-        # 他人の持ち物で group だけが読める 0044 のプランを回すと、写しの持ち主は init を打った利用者になる。
-        # 同じ利用者では作れない場面なので、権限を決める関数を直に確かめる
-        sys.dont_write_bytecode = True
-        sys.path.insert(0, str(PACE.parent))
-        try:
-            import pace
-        finally:
-            sys.path.pop(0)
-        self.assertEqual(pace.modes_for(0o044), (0o644, 0o755, 0o755))
-        self.assertEqual(pace.modes_for(0o600), (0o600, 0o700, 0o700))
-        self.assertEqual(pace.modes_for(0o664), (0o664, 0o775, 0o755))
-        self.assertEqual(pace.modes_for(0o400), (0o600, 0o700, 0o700))
-
     def test_kept_symlink_is_not_followed(self):
+        # shown.md が symlink なら、何を指していても触らない
         self.init()
         outside = self.dir / "outside.txt"
-        outside.write_text("x")
+        outside.write_text("外")
         os.chmod(str(outside), 0o644)
         shown = self.work / "shown.md"
         shown.unlink()
         os.symlink(str(outside), str(shown))
-        os.chmod(str(self.plan), 0o600)
         self.assertEqual(self.init().returncode, 0)
+        self.assertEqual(outside.read_text(), "外")
         self.assertEqual(os.stat(str(outside)).st_mode & 0o777, 0o644)
         self.assertTrue(shown.is_symlink())
-
-    def test_kept_hard_link_is_not_narrowed(self):
-        self.init()
-        outside = self.dir / "outside.txt"
-        outside.write_text("x")
-        os.chmod(str(outside), 0o644)
-        snap = self.work / "show_snapshot.md"
-        os.link(str(outside), str(snap))
-        os.chmod(str(self.plan), 0o600)
-        self.assertEqual(self.init().returncode, 0)
-        self.assertEqual(os.stat(str(outside)).st_mode & 0o777, 0o644)
 
     def test_uppercase_gitignore_name_is_refused(self):
         plan = self.dir / ".GITIGNORE.md"
@@ -307,23 +269,6 @@ class InitTest(unittest.TestCase):
         self.assertIn("作業ディレクトリの名前を作れない", r.stderr)
         self.assertFalse(self.pace.exists())
 
-    def test_old_show_snapshot_is_narrowed(self):
-        self.init()
-        snap = self.work / "show_snapshot.md"
-        snap.write_text("写し")
-        os.chmod(str(snap), 0o644)
-        os.chmod(str(self.plan), 0o600)
-        self.init()
-        self.assertEqual(os.stat(str(snap)).st_mode & 0o777, 0o600)
-
-    def test_old_shown_md_is_narrowed(self):
-        self.init()
-        self.assertEqual(os.stat(str(self.work / "shown.md")).st_mode & 0o777, 0o644)
-        os.chmod(str(self.plan), 0o600)
-        self.init()
-        self.assertEqual(os.stat(str(self.work / "shown.md")).st_mode & 0o777, 0o600)
-
-    @unittest.skipIf(os.geteuid() == 0, "root は権限を無視する")
     def test_unenterable_pace_dir_is_failure_without_traceback(self):
         self.pace.mkdir()
         os.chmod(str(self.pace), 0o000)

@@ -36,6 +36,11 @@ KEEP = frozenset({"cache", "rounds.jsonl", "shown.md", "show_snapshot.md", "sour
 
 UNREADABLE_STATUS = "PACE-STATUS: errors=1 failed_jobs=0 fixes=0 questions=0"
 
+# .pace/ の中は、init を打った利用者だけが読み書きする（プランの中身を他の利用者に読ませない）。
+# umask はこれをさらに狭めるだけで、広げはしない
+PRIVATE_FILE = 0o600
+PRIVATE_DIR = 0o700
+
 
 class PaceError(Exception):
     """errors に数えない失敗（読む権限が無い・書けない・作業ディレクトリが使えない）。標準エラーに理由を出して 1 で終わる。
@@ -407,7 +412,7 @@ def read_plan(plan):
 def workdir_for(plan):
     """プランの作業ディレクトリ（.pace/<拡張子を除いた名前>/）と .pace/ を返す。
 
-    名前が `.`・`..`・`.gitignore` になるプラン（`..md`・`...md`・`.gitignore.md`）は、
+    名前が `.`・`..`・`.gitignore`（大文字と小文字を区別しない）になるプラン（`..md`・`...md`・`.gitignore.md`）は、
     作業ディレクトリが .pace/ そのものやプランのディレクトリになり、作り直しで外を消すので断る。
     """
     pace_dir = plan.parent / ".pace"
@@ -482,7 +487,8 @@ def write_atomic(path, data, new_mode=None):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.chmod(tmp, mode)
+            # パスでなく開いたファイルに付ける（パスを差し替えられても、ほかのファイルの権限を変えない）
+            os.fchmod(f.fileno(), mode)
         os.replace(tmp, str(path))
     except BaseException as e:
         try:
@@ -492,41 +498,6 @@ def write_atomic(path, data, new_mode=None):
         if isinstance(e, OSError):
             raise OSError(e.errno, e.strerror, str(path))
         raise
-
-
-def modes_for(plan_mode):
-    """プランの権限から、(ファイル, 作業ディレクトリ, .pace/) の権限を決める。
-
-    プランを読める相手にだけ中身を読ませ、書ける相手には、そのプランの作業ディレクトリにも書かせる。
-    .pace/ には持ち主のほかに書く権限を渡さない（渡すと、同じディレクトリの別のプランの作業ディレクトリを
-    他人が差し替えられる）。持ち主（init を打つ利用者）は、元のプランの持ち主のビットに依らず読み書きできる。
-    """
-    file_mode = (plan_mode & 0o066) | 0o600
-    work_mode = pace_mode = 0o700
-    for read, write, rx in ((0o040, 0o020, 0o050), (0o004, 0o002, 0o005)):
-        if plan_mode & read:
-            work_mode |= rx
-            pace_mode |= rx
-        if plan_mode & write:
-            work_mode |= write
-    return file_mode, work_mode, pace_mode
-
-
-def narrow_kept(path, file_mode):
-    """残すファイル（前の起動が作った写し）を、file_mode より広い分だけ狭める（広げはしない）。
-
-    symlink・ふつうのファイルでないもの・hard link（ほかのパスと中身を分け合うもの）・ほかの利用者の物には
-    触らない（作業ディレクトリの外の権限を変えない）。
-    """
-    try:
-        st = os.lstat(str(path))
-    except FileNotFoundError:
-        return
-    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
-        return
-    narrowed = st.st_mode & 0o7777 & (file_mode | ~0o777)
-    if narrowed != st.st_mode & 0o7777:
-        os.chmod(str(path), narrowed)
 
 
 def clear_workdir(work):
@@ -555,9 +526,6 @@ def init(plan_arg):
         check_dir(pace_dir)
         check_dir(work)
         check_owner(plan, work)
-        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限（umask を当てたもの）を
-        # 持ち主のほかには広げない。0600 のプランを他の利用者に読ませないため。group は写さない（OS が決める）
-        file_mode, work_mode, pace_mode = modes_for(plan.stat().st_mode & 0o777 & ~current_umask())
     except OSError as e:
         raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     try:
@@ -566,21 +534,18 @@ def init(plan_arg):
         raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     units = split_units(text)
     try:
-        pace_dir.mkdir(mode=pace_mode, exist_ok=True)
-        write_atomic(pace_dir / ".gitignore", b"*\n")
-        work.mkdir(mode=work_mode, exist_ok=True)
-        write_atomic(work / "source.json", source)
+        pace_dir.mkdir(mode=PRIVATE_DIR, exist_ok=True)
+        write_atomic(pace_dir / ".gitignore", b"*\n", PRIVATE_FILE)
+        work.mkdir(mode=PRIVATE_DIR, exist_ok=True)
+        write_atomic(work / "source.json", source, PRIVATE_FILE)
         clear_workdir(work)
-        write_atomic(work / "plan.md", data, file_mode)
+        write_atomic(work / "plan.md", data, PRIVATE_FILE)
         lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
-        write_atomic(work / "units.jsonl", lines.encode("utf-8"), file_mode)
+        write_atomic(work / "units.jsonl", lines.encode("utf-8"), PRIVATE_FILE)
         shown = work / "shown.md"
+        # shown.md が symlink なら、何を指していても触らない（作業ディレクトリの外を書き換えない）
         if not os.path.lexists(str(shown)):
-            write_atomic(shown, data, file_mode)
-        # 前の起動が広い権限で作ったプランの写しを、いまの権限まで狭める。shown.md が symlink なら、
-        # 何を指していても触らない（cache/ と rounds.jsonl はプランの写しを持たないので変えない）
-        narrow_kept(shown, file_mode)
-        narrow_kept(work / "show_snapshot.md", file_mode)
+            write_atomic(shown, data, PRIVATE_FILE)
     except OSError as e:
         raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     print("units=%d" % len(units))
