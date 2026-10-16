@@ -60,6 +60,8 @@ class JoinTest(unittest.TestCase):
     def test_ascii_joint_gets_space_and_trailing_space_is_dropped(self):
         self.assertEqual([u["text"] for u in split("use the  \nconfig file")], ["use the config file"])
         self.assertEqual([u["text"] for u in split("日本語の   \n折り返し。")], ["日本語の折り返し。"])
+        # 片側でも ASCII なら空白を入れる（折り返す位置で本文が変わらないように）
+        self.assertEqual([u["text"] for u in split("設定が\n`cfg` にある")], ["設定が `cfg` にある"])
 
     def test_blank_line_starts_new_paragraph(self):
         self.assertEqual([u["text"] for u in split("一つ目\n\n二つ目")], ["一つ目", "二つ目"])
@@ -107,6 +109,7 @@ class QuoteTest(unittest.TestCase):
         units = split("## 本当の節\n\n> ## 引いた節\n\n本文。")
         self.assertEqual(units[1]["kind"], "heading")
         self.assertEqual(units[1]["text"], "引いた節")
+        self.assertEqual(units[1]["sec"], "本当の節")
         self.assertEqual(units[2]["path"], ["本当の節"])
         self.assertEqual(units[2]["sec"], "本当の節")
 
@@ -157,6 +160,9 @@ class FenceTest(unittest.TestCase):
     def test_indented_open_and_close(self):
         text = "- 項目\n\n      ```text\n      - 中\n      ```\n後。"
         self.assertEqual(kinds_texts(text), [("bullet", "項目"), ("code_line", "      - 中"), ("sentence", "後。")])
+
+    def test_code_line_is_not_normalized(self):
+        self.assertEqual(kinds_texts("```\n    f(**kwargs,   x)   \n```"), [("code_line", "    f(**kwargs,   x)")])
 
     def test_blank_lines_in_fence_are_dropped(self):
         self.assertEqual(kinds_texts("```\na\n\n   \nb\n```"), [("code_line", "a"), ("code_line", "b")])

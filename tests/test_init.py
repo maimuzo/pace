@@ -154,6 +154,20 @@ class InitTest(unittest.TestCase):
         self.assertEqual(self.init(plan).returncode, 0)
         self.assertTrue((self.pace / "a.b" / "units.jsonl").exists())
 
+    def test_names_that_would_escape_workdir_are_refused(self):
+        self.init()
+        neighbor = self.dir / "neighbor.txt"
+        neighbor.write_text("x")
+        for name in ("..md", "...md", ".gitignore.md"):
+            plan = self.dir / name
+            plan.write_text("一。", encoding="utf-8")
+            r = self.init(plan)
+            self.assertEqual(r.returncode, 1, name)
+            self.assertIn("作業ディレクトリの名前を作れない", r.stderr)
+        self.assertEqual(neighbor.read_text(), "x")
+        self.assertTrue((self.work / "units.jsonl").exists())
+        self.assertEqual((self.pace / ".gitignore").read_text(), "*\n")
+
     def test_version_is_unchanged(self):
         r = run("--version")
         self.assertEqual(r.returncode, 0)

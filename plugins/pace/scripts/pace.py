@@ -121,7 +121,8 @@ def join_pieces(pieces):
         piece = piece.strip()
         if not piece:
             continue
-        if raw and ord(raw[-1]) < 128 and ord(piece[0]) < 128:
+        # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる
+        if raw and (ord(raw[-1]) < 128 or ord(piece[0]) < 128):
             raw += " "
         starts.append((len(raw), line_no))
         raw += piece
@@ -332,9 +333,16 @@ def read_plan(plan):
 
 
 def workdir_for(plan):
-    """プランの作業ディレクトリ（.pace/<拡張子を除いた名前>/）と .pace/ を返す。"""
+    """プランの作業ディレクトリ（.pace/<拡張子を除いた名前>/）と .pace/ を返す。
+
+    名前が `.`・`..`・`.gitignore` になるプラン（`..md`・`...md`・`.gitignore.md`）は、
+    作業ディレクトリが .pace/ そのものやプランのディレクトリになり、作り直しで外を消すので断る。
+    """
     pace_dir = plan.parent / ".pace"
-    return pace_dir, pace_dir / plan.stem
+    name = plan.stem
+    if name in ("", ".", "..", ".gitignore"):
+        raise PaceError("プランの名前 %s からは作業ディレクトリの名前を作れないので、何も書きません。プランの名前を変えてください" % plan.name)
+    return pace_dir, pace_dir / name
 
 
 def check_dir(path):
@@ -364,7 +372,7 @@ def check_owner(plan, work):
     except OSError:
         pass
     raise PaceError(
-        "%s は %s の作業ディレクトリです。拡張子だけが違うプランは同じ作業ディレクトリを使うので、同時には回せません。"
+        "%s は %s の作業ディレクトリです。拡張子だけが違うか、拡張子だけを付け替えたプランは、同じ作業ディレクトリを使えません。"
         "%s を回すなら、%s の名前を変えるか、%s を消してから打ち直してください（消すと、%s の見せた記録も消えます）"
         % (work, recorded, plan.name, plan.name, work, recorded))
 
