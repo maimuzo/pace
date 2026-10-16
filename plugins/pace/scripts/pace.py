@@ -519,6 +519,11 @@ def clear_workdir(work):
             os.unlink(entry.path)
 
 
+def units_bytes(units):
+    """units.jsonl の中身。init が書き、next が分け直した単位と突き合わせる。"""
+    return "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units).encode("utf-8")
+
+
 def init(plan_arg):
     plan = Path(plan_arg)
     read = read_plan(plan)
@@ -546,8 +551,7 @@ def init(plan_arg):
         write_atomic(work / "source.json", source, PRIVATE_FILE)
         clear_workdir(work)
         write_atomic(work / "plan.md", data, PRIVATE_FILE)
-        lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
-        write_atomic(work / "units.jsonl", lines.encode("utf-8"), PRIVATE_FILE)
+        write_atomic(work / "units.jsonl", units_bytes(units), PRIVATE_FILE)
         shown = work / "shown.md"
         # shown.md が symlink なら、何を指していても触らない（作業ディレクトリの外を書き換えない）
         if not os.path.lexists(str(shown)):
@@ -676,7 +680,8 @@ def write_json(path, obj):
     try:
         data = dumps(obj).encode("utf-8")
     except UnicodeEncodeError:
-        raise PaceError("作業ディレクトリのパスが UTF-8 で表せないので、ジョブを書けません: %s" % path.parent)
+        raise PaceError("UTF-8 で書けない字があるので書けません（作業ディレクトリのパスか、書き換えられたファイル）。"
+                        "init を打ち直してください: %s" % path)
     write_atomic(path, data, PRIVATE_FILE)
 
 
@@ -777,6 +782,15 @@ class Round:
         # 単位は units.jsonl を読まず、プランから分け直す（init と同じ規則なので同じ単位になる）。
         # units.jsonl は Edit(**/.pace/**) で書き換えられうるので、網羅とノードの基準にしない
         self.units = split_units(text)
+        # ノードは unit で units.jsonl の単位を指すので、init が書いたものと同じ単位であることを確かめる
+        # （無い・書き換えられた・plugin を更新して分割の規則が変わったあとに init を打っていない、を止める）
+        try:
+            same = read_regular(self.work / "units.jsonl") == units_bytes(self.units)
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            raise PaceError("%s が、いまのプランを分けた単位と違います（無いか、書き換えられたか、分割の規則が"
+                            "変わりました）。init を打ち直してください" % (self.work / "units.jsonl"))
         # 前後の文は文書の中の位置で引く（節をまたいでよい。docs/idea.md 段2 の neighbors）
         self.pos = {u["id"]: i for i, u in enumerate(self.units)}
         source = self.work / "source.json"
@@ -875,7 +889,7 @@ class Round:
         """
         path = self.job_path(stage, job_id)
         m = JOB_ID.fullmatch(job_id)
-        if m is None:
+        if m is None:  # created() が先に断るので、ここは二重の守り
             raise PaceError("%s の名前の形が違います。init を打ち直してください" % path)
         job = load_work_json(path, lambda o: valid_job(o) and o["stage"] == stage)
         if stage == "classify":
@@ -954,24 +968,29 @@ class Round:
                                              {"units": chunk}, variant=variant))
         return jobs
 
-    def failed_units(self):
-        out = set()
-        for rec in self.failed_records():
-            out.update(rec.get("units", []))
+    def failed_jobs(self):
+        """この周の失敗したジョブ。列の ID のジョブファイルの status から数える。
+
+        failed_jobs.jsonl は人間が理由を読むための記録で、網羅とノードの基準にしない
+        （Edit(**/.pace/**) で書き換えられうるので、偽の記録で単位を外させない）。
+        """
+        rid = self.round_id()
+        out = []
+        for stage in JOB_STAGES:
+            for job_id in self.created(stage, rid) or []:
+                job = self.load_job(stage, job_id)
+                if job["status"] == "failed":
+                    out.append(job)
         return out
 
-    def failed_records(self):
-        path = self.work / "failed_jobs.jsonl"
-        if not os.path.lexists(str(path)):
-            return []
-        try:
-            recs = [json.loads(line) for line in read_regular(path).decode("utf-8").splitlines() if line]
-        except (OSError, ValueError, RecursionError) as e:
-            raise PaceError("%s を読めません（%s）。init を打ち直してください" % (path, e))
-        if not all(isinstance(r, dict) and is_str_list(r.get("units")) and isinstance(r.get("job_id"), str)
-                   for r in recs):
-            raise PaceError("%s の形が違います。init を打ち直してください" % path)
-        return recs
+    def failed_units(self):
+        out = set()
+        for job in self.failed_jobs():
+            if job["stage"] == "classify":
+                out.update(u["uid"] for u in job["input"]["units"])
+            else:
+                out.add(job["input"]["unit"]["uid"])
+        return out
 
     def classified(self, unit):
         return self.cache_get(self.classify_key("A", unit)), self.cache_get(self.classify_key("B", unit))
@@ -1038,15 +1057,17 @@ class Round:
             error = error[:ERROR_MAX_CHARS] + "…"
         job["previous_errors"].append(error)
         if n > MAX_RETRIES:
-            # 記録を先に書いてから failed にする。記録は job_id で重ねない
-            if job["job_id"] not in {r.get("job_id") for r in self.failed_records()}:
-                units = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
-                         else [job["input"]["unit"]["uid"]])
-                rec = {"job_id": job["job_id"], "stage": stage, "units": units, "errors": job["previous_errors"]}
-                path_f = self.work / "failed_jobs.jsonl"
+            # 人間が理由を読むための記録を書き足してから failed にする（数えるのはジョブの status）。
+            # 1行1件の JSON は ensure_ascii で書く（U+2028 などで行が割れないように）
+            units = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
+                     else [job["input"]["unit"]["uid"]])
+            rec = {"job_id": job["job_id"], "stage": stage, "units": units, "errors": job["previous_errors"]}
+            path_f = self.work / "failed_jobs.jsonl"
+            try:
                 old = read_regular(path_f) if os.path.lexists(str(path_f)) else b""
-                line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8", "backslashreplace")
-                write_atomic(path_f, old + line, PRIVATE_FILE)
+            except ValueError:
+                raise PaceError("%s がふつうのファイルではありません。init を打ち直してください" % path_f)
+            write_atomic(path_f, old + (json.dumps(rec) + "\n").encode("ascii"), PRIVATE_FILE)
             job["status"] = "failed"
         else:
             job["status"] = "pending"
@@ -1165,7 +1186,7 @@ class Round:
         write_json(self.work / "pending.json", {"bundles": []})
         decisions = sum(1 for n in nodes if n["kind"] == "decision")
         return ["DONE decisions=%d premises=%d failed_jobs=%d"
-                % (decisions, len(nodes) - decisions, len(self.failed_records()))]
+                % (decisions, len(nodes) - decisions, len(self.failed_jobs()))]
 
 
 def next_(plan_arg):
@@ -1173,6 +1194,9 @@ def next_(plan_arg):
         lines = Round(plan_arg).run()
     except OSError as e:
         raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or plan_arg))
+    except RecursionError:
+        # 読めるが書き戻せない深さの入れ子（書き換えられたジョブファイルなど）
+        raise PaceError("作業ディレクトリのファイルの入れ子が深すぎます。init を打ち直してください")
     try:
         sys.stdout.write("".join(line + "\n" for line in lines))
     except UnicodeEncodeError:

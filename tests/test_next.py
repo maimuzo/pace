@@ -122,12 +122,15 @@ class NextTest(unittest.TestCase):
         self.assertEqual(variants, ["A", "B"])
 
     def test_b_reverses_unit_order(self):
+        """B は節の順も、節の中の単位の順も逆にする。"""
         self.init()
         bundles, _ = parse(self.next().stdout)
-        a = json.loads(Path(bundles[0][2][0]).read_text(encoding="utf-8"))
+        a_jobs = [json.loads(Path(p).read_text(encoding="utf-8")) for p in bundles[0][2]]
         b_jobs = [json.loads(Path(p).read_text(encoding="utf-8")) for p in bundles[1][2]]
-        b_last = [u["uid"] for u in b_jobs[-1]["input"]["units"]]
-        self.assertEqual(b_last, list(reversed([u["uid"] for u in a["input"]["units"]])))
+        a_order = [u["uid"] for j in a_jobs for u in j["input"]["units"]]
+        b_order = [u["uid"] for j in b_jobs for u in j["input"]["units"]]
+        self.assertTrue(any(len(j["input"]["units"]) > 1 for j in a_jobs))
+        self.assertEqual(b_order, list(reversed(a_order)))
 
     def test_bundle_limits(self):
         jobs = [{"variant": "A", "job_id": "j%d" % i, "pad": "x" * 25000} for i in range(5)]
@@ -474,8 +477,6 @@ class NextTest(unittest.TestCase):
             "created": ("jobs/classify/created.json", "[]"),
             "round": ("jobs/round.json", "{}"),
             "job": (None, "[]"),
-            "failed": ("failed_jobs.jsonl", "[]\n"),
-            "failed_job_id": ("failed_jobs.jsonl", '{"job_id": [1], "units": []}\n'),
             "round_shape": ("jobs/round.json", '{"round": "zz"}'),
             "attempts": (None, "ATTEMPTS"),
         }
@@ -484,8 +485,6 @@ class NextTest(unittest.TestCase):
                 self.setUp()
                 self.init()
                 bundles, _ = parse(self.next().stdout)
-                if case in ("failed", "failed_job_id"):
-                    answer_all(bundles)  # 失敗の記録を読むのは、分類が終わって裁定を作るとき
                 path = Path(bundles[0][2][0]) if rel is None else self.work / rel
                 if text == "ATTEMPTS":
                     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -612,7 +611,7 @@ class NextTest(unittest.TestCase):
         self.assertEqual(self.next().stdout.strip(), last)
 
     def test_bad_names_in_work_files_stop(self):
-        """列の ID は形を確かめる。形の違う名前のジョブは、中身が正しくても読まない。"""
+        """列の ID は形を確かめる（created() が断る。load_job の確かめは二重の守り）。形の違う名前のジョブは、中身が正しくても読まない。"""
         self.init()
         bundles, _ = parse(self.next().stdout)
         d = self.work / "jobs" / "classify"
@@ -657,14 +656,65 @@ class NextTest(unittest.TestCase):
                 self.assertEqual(r.returncode, 1, mode)
                 self.assertNotIn("Traceback", r.stderr, mode)
 
-    def test_units_jsonl_is_not_trusted(self):
-        """units.jsonl を書き換えても、next はプランから分け直した単位でノードを作る。"""
+    def test_units_jsonl_must_match_plan(self):
+        """units.jsonl が無いか、プランを分けた単位と違えば、init を打ち直すよう出して 1 で終わる。"""
+        for mode in ("tampered", "missing"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                self.init()
+                self.drive()
+                if mode == "tampered":
+                    (self.work / "units.jsonl").write_text('{"id": "../x"}\n', encoding="utf-8")
+                else:
+                    (self.work / "units.jsonl").unlink()
+                r = self.next(ok=False)
+                self.assertEqual(r.returncode, 1)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertIn("init を打ち直して", r.stderr)
+                self.init()
+                self.assertTrue(self.next().stdout.startswith("DONE"))
+
+    def test_forged_failure_record_does_not_drop_units(self):
+        """failed_jobs.jsonl は記録で、失敗した単位はジョブの status から数える。"""
         self.init()
-        first = self.drive()
-        nodes1 = (self.work / "nodes.jsonl").read_text(encoding="utf-8")
-        (self.work / "units.jsonl").write_text('{"id": "../x"}\n', encoding="utf-8")
-        self.assertEqual(self.next().stdout.strip(), first)
-        self.assertEqual((self.work / "nodes.jsonl").read_text(encoding="utf-8"), nodes1)
+        uids = [u["id"] for u in self.units()]
+        bundles, _ = parse(self.next().stdout)
+        (self.work / "failed_jobs.jsonl").write_text(
+            json.dumps({"job_id": "../../x", "units": uids}) + "\n[]\n", encoding="utf-8")
+        answer_all(bundles)
+        last = self.drive()
+        self.assertEqual(last, "DONE decisions=%d premises=0 failed_jobs=0" % len(uids))
+
+    def test_line_separator_in_answer_does_not_break_record(self):
+        """U+2028 を含む誤答で失敗しても、記録が割れずに DONE まで進む。"""
+        bundles, job = self.first_job()
+        mine = str((self.work / "jobs" / "classify" / (job["job_id"] + ".json")).absolute())
+        bad = json.dumps({"units": [{"uid": "x\u2028y", "labels": []}]}, ensure_ascii=False)
+        others = [(b, a, [p for p in ps if p != mine]) for b, a, ps in bundles]
+        answer_all(others)
+        for _ in range(4):
+            Path(job["out_path"]).write_text(bad, encoding="utf-8")
+            bundles, _ = parse(self.next().stdout)
+            answer_all([(b, a, [p for p in ps if p != mine]) for b, a, ps in bundles])
+        self.assertEqual(self.reload(job)["status"], "failed")
+        last = self.drive()
+        self.assertTrue(last.endswith("failed_jobs=1"), last)
+        rec = (self.work / "failed_jobs.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(len(rec.splitlines()), 1)
+
+    def test_deeply_nested_job_does_not_traceback(self):
+        """読めても書き戻せない深さの入れ子は、深さに依らず Traceback を出さない（読む段か書く段で 1 になる）。"""
+        for depth in range(970, 1000, 3):
+            with self.subTest(depth=depth):
+                self.setUp()
+                self.init()
+                bundles, _ = parse(self.next().stdout)
+                path = Path(bundles[0][2][0])
+                text = path.read_text(encoding="utf-8").rstrip().rstrip("}")
+                path.write_text(text + ', "x": ' + "[" * depth + "]" * depth + "}", encoding="utf-8")
+                for _ in range(2):
+                    r = self.next(ok=False)
+                    self.assertNotIn("Traceback", r.stderr, depth)
 
     def test_more_than_999_jobs(self):
         """片側の分類のジョブが1000件を超えても、名前の形の確かめで止まらない。"""
