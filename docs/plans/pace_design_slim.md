@@ -12,7 +12,7 @@
 **言いたいこと。**PACE は、AI が書いた設計プランから根拠のグラフを作る。根拠の無い決定・循環論法・プランに無い前提への依存を洗い出し、書き手（AI）が直すものと、人間が決めるものに分けて返す。continuo を知らない、単独の Claude Code プラグインとして配る。
 
 - 入れ方: `claude plugin marketplace add maimuzo/pace` → `claude plugin install pace@pace`。更新は `claude plugin marketplace update pace` と `claude plugin update pace@pace`。マージ前に手元から試すときは `claude --plugin-dir <checkout>/plugins/pace`。
-- 権限: `pace.py` は skill の `allowed-tools` で、起動したターンの間は確認なしで叩ける見込み（1回叩けることは確かめた）。subagent の書き込みは、利用者が settings に `Edit(**/.pace/**)` を足して許す（README に書く）。
+- 権限: `pace.py` は skill の `allowed-tools` で、起動したターンの間だけ確認なしで叩ける。subagent はバックグラウンドで動き、その完了の知らせで始まるターンには許可が続かないので、確認を出すモードでは利用者が settings に `Bash(python3 "<pace.py の絶対パス>" *)` と `Edit(**/.pace/**)` を足す（README に書く。途中を `*` にした規則で continuo の2本、絶対パスの規則で89単位のプランの写しを、確認なしで最後まで回せた）。
 - 部品は4つ。
   - `pace.py`: 機械の仕事を受け持つ。AI は呼ばず、プランも書き換えない。
   - `SKILL.md`: 周を回す。
@@ -38,6 +38,7 @@ sequenceDiagram
     M->>M: 回答を質問と組にしてプランへ書き、起動し直す
 ```
 
+- `next` は、AI に頼むジョブ（分類 A/B・裁定）を束にして1回に4束まで出し、答えを検証して取り込む。答えが落ちたら3回まで差し戻し、使い切ったら失敗したジョブとして記録して先へ進む。答えはキャッシュに残し、指示文や agent の定義が変わったら作り直す。continuo の issue134（932単位）は33回の呼び出しで回った（1ジョブ1回なら208回）。
 - 周を続けるか止めるかは、`pace.py` が決める。AI の申告には頼らない。
 - 書き手がプランに足してよい文は、3種類だけ。確かめた事実（出どころ付き）・設計の変更・人間の回答（質問の文と原文の組）。価値や要求の理由は書かずに、人間に訊く。
 - 秘密や個人の絶対パスは、プランにも注記にも書かない。
@@ -52,8 +53,9 @@ sequenceDiagram
 ## 防がないこと（限界の要点）
 
 - 書き手が決まりを守ったか、事実の出どころが実在するかは、機械では確かめない。人間に見せる差分と注意で補う。
-- plan mode の中では回らない。プランは plan mode の外で書き、PACE も plan mode の外で起動する（[#2](https://github.com/maimuzo/pace/issues/2) で1回試して判断した。skill から subagent を呼ばせる形ができたら確かめ直す）。
-- 判定役の `opus` が使えるかは、利用者の環境ごとに違い、確かめていない。
+- plan mode の中では回らない。プランは plan mode の外で書き、PACE も plan mode の外で起動する（[#2](https://github.com/maimuzo/pace/issues/2) で手で頼んだとき、[#4](https://github.com/maimuzo/pace/issues/4) で skill から呼んだとき、どちらもプランを書いて止まった）。
+- 判定役の `opus` が使えるかは、利用者の環境ごとに違い、確かめていない。環境変数・組織の設定・Claude Code の更新でモデルが変わっても、キャッシュの答えは作り直されない（そのときは `cache/` を空にする）。
+- 束の結果が返る前に `next` を打つと、答えの無いジョブが差し戻しの1回に数えられる。束とジョブの大きさ・並列の数は仮の値で、[#9](https://github.com/maimuzo/pace/issues/9) で測り直す。
 - subagent の書き込みを許す規則（`Edit(**/.pace/**)`）は、プランが Claude Code を起動したディレクトリの下にあるときにしか当たらない見込み。メインのセッションの書き込みにも効くので、書き手が `*.out.json` を自分で書いても確認の画面では気づけない。
 - 別の文書にある根拠は gap として出る。使ってみてから作り込むかを決める（[#9](https://github.com/maimuzo/pace/issues/9)）。
 - 拡張子だけが違う2本のプラン（`plan.md` と `plan.txt`）は、作業ディレクトリが同じ `.pace/plan/` になるので、同時には回せない。拡張子だけを付け替えたプランも同じで、`init` は止まって知らせる。作業ディレクトリを消すと通るが、見せた記録も消える。

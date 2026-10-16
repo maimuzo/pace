@@ -4,7 +4,7 @@ PACE: Pathway Autonomous Construction Engine A framework for autonomous construc
 AI が書いた設計プランから根拠のグラフを作り、根拠の無い決定・循環論法・プランに無い前提への依存を洗い出す Claude Code プラグインです。
 設計の正は [docs/plans/pace_design.md](docs/plans/pace_design.md) にあります。
 
-**いまの版は、プラグインの骨組みだけです。**`/pace:pace` は段ごとの版の一覧を出すだけで、周を回す仕組みは後の版で足します。
+**いまの版は、根拠のグラフの途中までです。**`/pace:pace <プランのパス>` は、プランを単位に分け、AI に頼む仕事（分類と、2回の分類が食い違ったときの裁定）を束にして subagent へ渡し、決定と前提のノード（プランの隣の `.pace/<プランの名前>/nodes.jsonl`）を作って `DONE` の行を見せたところで止まります。根拠付け・循環の検出・直すものと人間に訊くものの返し方は、後の版で足します。
 
 ## 前提
 
@@ -19,7 +19,7 @@ claude plugin marketplace add maimuzo/pace
 claude plugin install pace@pace
 ```
 
-入ったら、Claude Code のセッションで `/pace:pace` を打つと、段ごとの版の一覧が出ます。
+入ったら、Claude Code のセッションで `/pace:pace <プランのパス>` を打ちます（下の「権限の設定」の規則を先に足してください）。
 
 ## 更新
 
@@ -75,11 +75,18 @@ claude plugin marketplace remove pace --scope local
 **pace.py（Bash）**
 
 `/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。公式文書の要約では、skill を起動したターンの間は確認なしで叩け、次に人間が発言すると、この許可は消えます。
-確かめたのは、user settings を読まない起動（`--setting-sources project,local`）で1回叩けたことだけです。同じターンの中で何度も叩いても許可が続くかは、確かめていません。
+確認を出すモード（`manual`）で確かめたところ、起動したターンの中では確認なしで進みましたが、subagent はバックグラウンドで動き、その完了の知らせで始まったターンで `pace.py` を叩くときに確認が出ました（2.1.301、user settings を読む起動）。確認を出したくないときは、下の書き込みの規則と一緒に、pace.py の絶対パスを書いた規則を足してください。パスは、`/pace:pace` を打ったときの確認の画面か、Bash のコマンドの表示に出ます（入れた plugin なら `~/.claude/plugins/cache/pace/pace/<commit の sha>/scripts/pace.py` の形で、plugin を更新すると変わるので、そのたびに直してください）。
+
+```json
+{"permissions": {"allow": ["Bash(python3 \"/Users/you/.claude/plugins/cache/pace/pace/0123abcd/scripts/pace.py\" *)", "Edit(**/.pace/**)"]}}
+```
+
+- `Bash(python3 *scripts/pace.py*)` のように途中を `*` にすると、`scripts/pace.py` という文字列を含むどんな `python3` のコマンドも確認なしで通るので、勧めません。
+- 規則を足すと、確認なしで最後まで回せました（2.1.301。途中を `*` にした規則で continuo の2本のプラン（89単位と932単位）、絶対パスの規則で89単位のプランの写しを確かめました）。
 
 **subagent の書き込み（Write）**
 
-後の版の PACE は、実行役の subagent（`pace:pace-worker` と `pace:pace-judge`）にジョブを渡し、答えをプランの隣の `.pace/` の下へ書かせます（いまの版は、まだ subagent を呼びません）。
+PACE は、実行役の subagent（`pace:pace-worker` と `pace:pace-judge`）にジョブを渡し、答えをプランの隣の `.pace/` の下へ書かせます。
 確認を出すモードでは、書き込みごとに確認が出る見込みです（公式文書の要約。確かめていません）。確認を出したくないときは、プロジェクトの `.claude/settings.local.json` か `.claude/settings.json` に次を足してください。
 
 ```json
@@ -87,7 +94,7 @@ claude plugin marketplace remove pace --scope local
 ```
 
 - `Write(…)` ではなく `Edit(…)` で書きます。ファイルの規則は Edit と Read で見られ、Write の規則は見られないためです（公式文書の要約）。
-- この規則を足し、確認を出すモード（`manual`）で subagent に書かせたところ、確認は出ませんでした。確かめた条件は、2.1.301、user settings を読まない起動（`--setting-sources project,local`）、subagent はバックグラウンドで動いた、です。規則を足さないときに確認が出るかは確かめていません。
+- この規則を足し、確認を出すモード（`manual`）で subagent に書かせたところ、確認は出ませんでした。確かめた条件は、2.1.301、user settings を読まない起動（`--setting-sources project,local`）と読む起動の両方、subagent はバックグラウンドで動いた、です。規則を足さないときに確認が出るかは確かめていません。前面で動く subagent では確かめていません（Agent の呼び出しに前面を選ぶ手段がありませんでした）。
 - 規則が当たるのは、プランが Claude Code を起動したディレクトリの下にあるときだけの見込みです（パスの規則の書き方からの推論。確かめていません）。
 - 規則は subagent に限らず、メインのセッションの `.pace/` への書き込みにも効きます（公式文書の要約。確かめていません）。そのため、メインのセッションが subagent の答え（`*.out.json`）を自分で書いても、確認の画面では気づけません。
 
@@ -103,14 +110,20 @@ claude plugin marketplace remove pace --scope local
 {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"}}
 ```
 
+AI の答えは、プランの隣の `.pace/<プランの名前>/cache/` に残し、次の起動で使い回します。agent の定義が変わると作り直しますが、次の3つの場合はモデルが変わっても気づけないので、`cache/` を空にしてから回してください。
+
+- 上の環境変数でモデルを差し替えたとき（2.1.251 より前は `_FORCE` 無しでも効きます）
+- 組織の `availableModels` で、使うモデルが置き換わったとき
+- Claude Code を更新して、`sonnet`・`opus` が指すモデルが変わったとき
+
 ## plan mode では使わない
 
 **プランは plan mode の外で書き、PACE も plan mode の外で起動してください。**
 
-plan mode のセッション（2.1.301、user settings を読まない起動）で1回ずつ試したところ、次のようになりました。
+plan mode のセッション（2.1.301）で試したところ、次のようになりました。
 
-- `/pace:pace`（`pace.py --version` を叩くだけ）は、確認なしで動きました。書き込みを伴う pace.py の段（`init`）は、plan mode では試していません。
-- 実行役の subagent にジョブを渡すよう手で頼むと、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まりました。
+- `/pace:pace <プランのパス>` を打つと、`init` も叩かずにプランを書き、plan mode を抜けてよいかの確認で止まりました（user settings を読む起動）。
+- 実行役の subagent にジョブを渡すよう手で頼んだときも、subagent を呼ばずにプランを書き、同じ確認で止まりました（user settings を読まない起動）。
 - plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になりました。上の権限の規則は当たらない見込みです（推論。確かめていません）。
 
-PACE の1回の起動は subagent にジョブを渡すことを要するので、plan mode の中では回らないと判断しました。skill から subagent を呼ばせる形は後の版で作るので、そのときに確かめ直します。
+PACE の1回の起動は subagent にジョブを渡すことを要するので、plan mode の中では回りません。

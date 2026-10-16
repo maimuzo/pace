@@ -34,7 +34,7 @@ plugins/pace/skills/pace/SKILL.md        周の回し方。メインのセッシ
 plugins/pace/agents/pace-worker.md       model: sonnet / tools: Read, Write。分類・根拠付け
 plugins/pace/agents/pace-judge.md        model: opus / tools: Read, Write。裁定・輪を断つ・反論
 plugins/pace/scripts/pace.py             --version（段ごとの版の一覧）/ init / next / verify / report / show / shown（--version 以外はプランのパスを取る）
-tests/                                   plugins/pace の外に置く（plugin のキャッシュに入れないため）。test_split.py は sys.path に plugins/pace/scripts を足して import pace し（__pycache__ をプラグインに書かない）、test_init.py は sys.executable で pace.py を叩く。python3 -m unittest discover -s tests
+tests/                                   plugins/pace の外に置く（plugin のキャッシュに入れないため）。test_split.py は sys.path に plugins/pace/scripts を足して import pace し（__pycache__ をプラグインに書かない）、test_init.py と test_next.py は sys.executable で pace.py を叩く（test_next.py は束の分け方・鍵の計算・定数だけ import して確かめる）。python3 -m unittest discover -s tests
 ```
 
 | 決めたこと | 根拠 |
@@ -47,8 +47,8 @@ tests/                                   plugins/pace の外に置く（plugin �
 | 判定役を opus、ほかを sonnet。SKILL.md は呼び出しで model を渡さない | [../idea.md:513](../idea.md#L513) の使い分けを、呼び出し側の設定に左右されないようにする |
 | Python 3.9 以上・標準ライブラリだけ | macOS の Command Line Tools の python3 が 3.9 で、入れる手順が要らない。Windows は確かめていないので対象に入れない |
 | SKILL.md の `allowed-tools` を `Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)` にし、本文に同じ文字列で `--version` などを書く | plugin の skill では、本文と `allowed-tools` の2か所で `${CLAUDE_PLUGIN_ROOT}` が置き換わる（公式文書の要約）。#2 で、`--plugin-dir` で読んだものと branch から入れたもの（cache の sha のディレクトリ）の両方で、確認なしで叩けた（Claude Code 2.1.301、user settings を読まない起動） |
-| 許可が効くのは、skill を起動したターンの間だけ | 次に人間が発言すると消える（公式文書の要約）。1回の起動の前半を人間の発言を挟まずに回せば、その間は確認が出ない見込み（推論。同じターンで何度も叩けるかは [#4](https://github.com/maimuzo/pace/issues/4) で確かめる） |
-| subagent の書き込みは、利用者が settings に `Edit(**/.pace/**)` を足して許す（README に書く） | plugin の agent では `permissionMode` が無視され、親の権限を受け継ぐ。ファイルの規則は Edit と Read で見られ、Write の規則は見られない（公式文書の要約）。#2 で、この規則を足した `manual` のモードで、pace-worker と pace-judge が確認なしに書けた（2.1.301、user settings を読まない起動、subagent はバックグラウンドで動いた。規則なしで確認が出るかは確かめていない） |
+| 許可が効くのは、skill を起動したターンの間だけ。subagent の完了の知らせで始まるターンには続かないので、確認を出すモードでは利用者が settings に `Bash(python3 "<pace.py の絶対パス>" *)` を足す（README に書く。`scripts/pace.py` を含めば何でも通す `*` の形は、任意の python3 を許すので勧めない） | 次に人間が発言すると消える（公式文書の要約）。#4 で、起動したターンの中では `init`・`next`・最初の波まで確認なしで進み、バックグラウンドの subagent の知らせのあとの `next` に確認が出た。規則を足すと出なかった（14節。2.1.301・`manual`・user settings を読む起動） |
+| subagent の書き込みは、利用者が settings に `Edit(**/.pace/**)` を足して許す（README に書く） | plugin の agent では `permissionMode` が無視され、親の権限を受け継ぐ。ファイルの規則は Edit と Read で見られ、Write の規則は見られない（公式文書の要約）。#2 で、この規則を足した `manual` のモードで、pace-worker と pace-judge が確認なしに書けた（2.1.301、user settings を読まない起動、subagent はバックグラウンドで動いた。規則なしで確認が出るかは確かめていない）。#4 で、user settings を読む起動でも確認は出なかった（14節） |
 | モデルの差し替えは、利用者が settings の `env` に `CLAUDE_CODE_SUBAGENT_MODEL` と `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` を書く（README に書く。確かめていない） | Claude Code が持つ差し替えの手段で、plugin の側に仕組みが要らない。引き換えに全部の subagent が同じモデルになり、上の行の使い分けが消える（[限界](#10-限界)）。API など subagent 以外の実行役への差し替えは、ジョブを JSON ファイルで渡す形（[../idea.md:310](../idea.md#L310)）が受け皿なので、仕組みを足さない |
 | `pace.py --version` は、AI に頼む段（`classify`・`adjudicate`・`link`・`decycle`・`review`）ごとに `<段の名前> <版>` を1行ずつ出す。版の形は `2026-10-16.1` | 版はキャッシュの鍵に入る（[../idea.md:316](../idea.md#L316)）ので、鍵を持つ段だけに付ける。名前は [../idea.md:801-846](../idea.md#L801-L846)、形は [../idea.md:475](../idea.md#L475) の `prompt_version` に揃える |
 | マージ前に手元から試すときは `claude --plugin-dir <checkout>/plugins/pace`。push 済みの branch から入れて試すなら `claude plugin marketplace add 'maimuzo/pace#<branch 名>' --scope local` → `claude plugin install pace@pace --scope local`（README に書く。#2 で確かめた）。checkout のパスから入れる形も README に書く（確かめていない） | `--plugin-dir` はそのセッションだけ読み込み、利用者の設定を変えない。入れた plugin は cache に写るので、編集の反映には commit と update が要ることがある |
@@ -58,7 +58,7 @@ tests/                                   plugins/pace の外に置く（plugin �
 
 **退けた案。**
 - version を書いて PR ごとに上げる: 上の表の理由で採らない。
-- ExitPlanMode の hook から skill を促す形（[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている）: #2 で、PACE は plan mode の中では回らないと判断した（[限界](#10-限界)）。plan mode を出たあとに回すと「設計を完了させる前」にならないので、この形のままでは採れない。[#4](https://github.com/maimuzo/pace/issues/4) で skill から subagent を呼ばせて確かめ直し、plan mode の中で回ると分かったら拾い直す。
+- ExitPlanMode の hook から skill を促す形（[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている）: #2 で、PACE は plan mode の中では回らないと判断した（[限界](#10-限界)）。plan mode を出たあとに回すと「設計を完了させる前」にならないので、この形のままでは採れない。[#4](https://github.com/maimuzo/pace/issues/4) で skill から呼ばせても、plan mode では `init` も叩かずにプランを書いて止まった（14節）。
 
 ---
 
@@ -70,7 +70,7 @@ tests/                                   plugins/pace の外に置く（plugin �
 - 既定: `show.md` をチャットに出し、`shown` を打ってから止まる。
 - `--no-ask`: `show.md` のパスと、shown を打つコマンド行（写しの sha256 を含む）を返して終わる。コマンド行にはスクリプトの絶対パスが入るので、呼び出し側はそれを公開の場に写さない。
 - SKILL.md はメインのセッションでインラインに動く（fork しない）。subagent は subagent を起動できないためである。
-- 書き手は束を必ず subagent へ渡す。`*.out.json` を自分で書かない（[pace.py が守る性質と SKILL.md の決まり](#8-pacepy-が守る性質と-skillmd-の決まり)）。
+- 書き手は束を必ず subagent へ渡し、全部の結果が返ってから次の `next` を打つ。`*.out.json` を自分で書かない（[pace.py が守る性質と SKILL.md の決まり](#8-pacepy-が守る性質と-skillmd-の決まり)）。
 
 ```mermaid
 sequenceDiagram
@@ -81,9 +81,9 @@ sequenceDiagram
     M->>S: python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" init docs/plans/impl/issue224_config_reload.md
     loop 束が尽きるまで
         M->>S: pace.py next docs/plans/impl/issue224_config_reload.md
-        S-->>M: pending.json（束 b003: 分類 A のジョブ20件）
-        M->>W: 束1つ（並列で数束）
-        W-->>S: 各ジョブの *.out.json
+        S-->>M: BUNDLE b001 pace:pace-worker / JOB …/classify_A_001_7f3a9c21.json …（1つの波に4束まで）
+        M->>W: 束ごとに1回（1つの波の束は並列で）
+        W-->>S: 各ジョブの *.out.json（全部が返ってから次の next）
     end
     M->>S: pace.py report docs/plans/impl/issue224_config_reload.md
     S-->>M: PACE-STATUS: errors=0 failed_jobs=0 fixes=12 questions=4 / NEXT: continue
@@ -152,9 +152,10 @@ sequenceDiagram
 | BOM を外し、`\r` だけの行の終わりも扱う | BOM 付きの UTF-8 を「UTF-8 でない」と数えない |
 | 4つ字下げのコードブロックは捨てずに、段落か箇条書きの本文にする（idea.md 段1はコードブロックを捨てる） | 箇条書きの続きと見分けられない（[入力](#4-入力) の退けた案） |
 | 差し戻しを3回使い切ったジョブは「失敗したジョブ」として記録して先へ進む。その影響を受けた決定と単位は、fixes と questions から外し、`show.md` の「確かめられなかったもの」に出す | 1件の失敗で、ほかの結果を全部捨てない。失敗をプランの穴に見せない |
-| エラー（errors）として数えるのは、プランを読めないこと（ファイルが無い・UTF-8 でない）だけ。ほかの失敗（読む権限が無い・書けない など）は pace.py が 0 以外で終わって知らせる（[作業ディレクトリ](#9-作業ディレクトリ) の判定の順） | 根拠の無い決定は、エラーではなく fixes の中身である |
+| エラー（errors）として数えるのは、`init` がプランを読めないこと（ファイルが無い・UTF-8 でない）だけ。ほかの失敗（読む権限が無い・書けない など）と、`next` がプランを読めないときは、pace.py が 0 以外で終わって知らせる（[作業ディレクトリ](#9-作業ディレクトリ) の判定の順。`next` が 1 で終わる理由の列は14節） | 根拠の無い決定は、エラーではなく fixes の中身である |
 | 根に届かない反証（idea.md 段7）は、エラーにせず、止めているものの側に出す | 直す先は止めているもので、設計ではない |
 | ジョブを束にして渡す | 呼び出し1回に約7万トークンの固定分がかかる（[../idea.md:601](../idea.md#L601)） |
+| `next` の決まり（14節）: 束は字数と件数で切り1つの波に4束まで／出力の行は `BUNDLE`・`JOB`・`WAVE`・`DONE`（idea.md は `完了。AI のジョブは残っていない。`）／`pending.json` は保留中の全部ではなくいまの波の記録で、判定の元はジョブの `status`／`jobs/<段>/` には done・failed のジョブと答えも残り、作り終えた印に `created.json`、名前に周の印を入れる／`out_path` は絶対パス／ジョブは `indent=1`・`ensure_ascii=False` で、分類のジョブは `variant`（A か B）を持つ／差し戻した答えを `rejected-<n>` で残し、答えの無いジョブも試行に数え、差し戻しの上限を `MAX_RETRIES` と呼ぶ／失敗したジョブを同じ周で出し直さず、その単位のノードを作らない／分類と裁定に `kind` を渡し、指示文に code_line を足し（裁定には文脈を確かめる1文も足す）、分類は20,000字でも切る／裁定の鍵に前後の文を入れず、鍵に agent の定義の sha256 を入れ、鍵はジョブに持たず（`cache_key` は空）判定のときに作り直す／段の出力は `results/` でなく `cache/`、周の結果は `nodes.jsonl`・`failed_jobs.jsonl`／`next` はプランが `init` のあとで変わったら 1 で終わる／ノード化の前に網羅を確かめる | 束と波は費用と待ち時間のため。ほかは途中で落ちたとき・遅れた答え・指示文の変更で、古い答えや拾い漏れを結果に混ぜないため |
 | レポートを fixes.md・questions.md に分け、人間に見せるものは `show` が show.md にまとめる。切った辺は report.md に載せる | 書き手が直すもの・人間が決めるもの・人間に見せるものを分ける |
 | 要求の gap を、AI が直す側から人間に訊く側へ移す | 書き手が要求を自分で作ると、それが根っこになる |
 | 周の判定（NEXT の行）を pace.py に置き、上限を最後に見せてから3周にする | 周回の制御は機械が行う（[../idea.md:311](../idea.md#L311)） |
@@ -213,7 +214,7 @@ NEXT: continue
 **前半。**
 - 1周は `init` → `next` を束が尽きるまで → `report` である。
 - `NEXT: continue` なら、書き手は fixes を直して次の周へ進む。`NEXT: show` なら後半へ進み、その起動の中ではもうプランを直さない。
-- pace.py が 0 以外で終わったら（`.pace/` に書けない、などのプラン以外の失敗）、SKILL.md はそこで止めて理由を見せる。
+- pace.py が 0 以外で終わったら（`.pace/` に書けない、などのプラン以外の失敗と、`next` の前に `init` を打ち直すべきとき（プランが読めない・変わった・網羅の欠けなど。14節））、SKILL.md はそこで止めて理由を見せる。
 
 **後半。**
 - `pace.py show` を打つ。`show` は `show.md` と、プランの写し `show_snapshot.md` を書き、写しの sha256 を出す。
@@ -245,7 +246,7 @@ NEXT: continue
 2. **`shown.md` は `shown <プラン> <sha256>` でしか進まない。**`show_snapshot.md` の sha256 が引数と合うときだけ写しを繰り上げ、写しが無いか合わないときは何もせず理由を出す。`init` は `shown.md` が無いときだけ、その時点のプランの写しで作り、`show.md` の差分に「初回（まだ人間に見せていない基準）」と添える。
 3. **失敗したジョブと、その影響を受けた決定と単位は、fixes と questions に入れず、`show.md` の「確かめられなかったもの」に出す。**影響を辿る範囲は [#6](https://github.com/maimuzo/pace/issues/6) の計画で決め、[#7](https://github.com/maimuzo/pace/issues/7) はそれに従う。
 4. **`show` が書く `show.md` の中身は、呼ばれ方に依らず同じである。**プランから引いた原文と差分はコードブロックで囲み、中のパスはプランと同じディレクトリからの相対にする。
-5. **errors は、プランを読めないことだけを数える。**そのとき `init` が `PACE-STATUS: errors=1 …` と `NEXT: show` を出し、`show` は「読めなかった」とだけ書いて写しを作らない。
+5. **errors は、`init` がプランを読めないことだけを数える（`next` は読めないとき 1 で終わる。`next` が 1 で終わる理由の列は14節）。**そのとき `init` が `PACE-STATUS: errors=1 …` と `NEXT: show` を出し、`show` は「読めなかった」とだけ書いて写しを作らない。
 
 **SKILL.md の決まり。**
 1. 書き手がプランに足してよい文は3種類だけである。
@@ -258,7 +259,7 @@ NEXT: continue
 3. `show.md` の境目の行より前（pace.py が書いた部分）は、削りも書き換えもせず、既定の起動ではその全部を見せる。
 4. `NEXT: show` のあとは、その起動の中ではプランを直さない。
 5. `shown` は人間に見せたあとにだけ打つ。既定の起動では、チャットに出した時点を「見せた」とする。
-6. 束は必ず subagent に渡し、`*.out.json` を自分で書かない。
+6. 束は必ず subagent に渡し、全部の結果が返ってから次の `next` を打つ。`*.out.json` を自分で書かない。
 
 ---
 
@@ -266,9 +267,9 @@ NEXT: continue
 
 **言いたいこと。**作業ディレクトリはプランの隣の `.pace/` に置き、`.pace/.gitignore` で丸ごと無視させる。`init` は記録とキャッシュを残して、ほかを作り直す。
 
-- 場所: `<プランと同じディレクトリ>/.pace/<プランのファイル名の拡張子を除いたもの>/`（例 `docs/plans/impl/.pace/issue224_config_reload/`）。中の構成は [../idea.md:484-498](../idea.md#L484-L498) の表に、上の節で足したファイルを加えたもの。
+- 場所: `<プランと同じディレクトリ>/.pace/<プランのファイル名の拡張子を除いたもの>/`（例 `docs/plans/impl/.pace/issue224_config_reload/`）。中の構成は [../idea.md:484-498](../idea.md#L484-L498) の表に、上の節で足したファイルを加えたもの（`results/`・`stats_*.json`・`summary.json` は作らない。`next` が書くのは `jobs/`・`cache/`・`pending.json`・`failed_jobs.jsonl`・`nodes.jsonl`。14節）。
 - `init` は、プランを読めて作業ディレクトリを確かめたあと（下の順の5）に、`<プランと同じディレクトリ>/.pace/.gitignore`（中身は `*` の1行）を書く。`git status --porcelain` は無視されたファイルを出さないので、commit に入らず、worktree の片付けも止まらない。
-- `init` は `cache/`・`rounds.jsonl`・`shown.md`・`show_snapshot.md` を残し、ほかを作り直す（P5 とキャッシュの両立。[../idea.md:69](../idea.md#L69)・[../idea.md:316](../idea.md#L316)）。作り直しで書くのは `plan.md`（プランのバイトの写し）・`units.jsonl`・`source.json`（元のプランのファイル名。`design.markdown` なら `{"plan_file": "design.markdown"}`。これも残す）で、`shown.md` は無いときだけプランの写しで作る。`.pace/` の中は、`init` を打った利用者だけが読み書きする（新しく作るファイルは 0600、`.pace/` と作業ディレクトリは 0700 に、umask に依らず揃える）。プランの中身を他の利用者に読ませないためで、プランの権限には合わせない。一時ファイルの権限は、パスでなく開いたファイルに付ける。既にあるファイル（`.gitignore`・`source.json`）は、いまの権限を写す。symlink の `shown.md` は、何を指していても触らない。
+- `init` は `cache/`・`rounds.jsonl`・`shown.md`・`show_snapshot.md` を残し、ほかを作り直す（P5 とキャッシュの両立。[../idea.md:69](../idea.md#L69)・[../idea.md:316](../idea.md#L316)）。作り直しで書くのは `plan.md`（プランのバイトの写し）・`units.jsonl`・`source.json`（元のプランのファイル名。`design.markdown` なら `{"plan_file": "design.markdown"}`。これも残す）で、`shown.md` は無いときだけプランの写しで作る。`.pace/` の中は、`init` を打った利用者だけが読み書きする（新しく作るファイルは 0600、`.pace/` と作業ディレクトリは 0700 に、umask に依らず揃える）。プランの中身を他の利用者に読ませないためで、プランの権限には合わせない。一時ファイルの権限は、パスでなく開いたファイルに付ける。既にあるファイル（`.gitignore`・`source.json`）は、いまの権限を写す。symlink の `shown.md` は、何を指していても触らない。pace.py が書くファイルとディレクトリは 0600 と 0700 に揃えるが、subagent が Write で書く `*.out.json` と、その名前を変えた `rejected-*` は Write の権限のまま（0700 の作業ディレクトリの中なので、ほかの利用者からは読めない）。
 - キャッシュ無しで測るときは、`cache/` を空にしてから回す。
 
 **`init` の判定の順（[#3](https://github.com/maimuzo/pace/issues/3)）。**作業ディレクトリの中身を変えるのは、プランを読めて、そこがいまのプランのものと確かめたあとだけにする。
@@ -298,15 +299,15 @@ NEXT: continue
 - 叩いたコマンドの出力の要点は書き手の言い換えだが、根っこの前提になる。出どころを伏せた事実は、公開の場では辿れない。
 - 別の文書の根拠は gap として出る（[入力](#4-入力)）。
 - 別案の数が実行ごとに揺れ、gap が減らないことがある（[../idea.md:597](../idea.md#L597)）。切った辺の記憶は、両端の文が変わるまで残る。
-- 英語のプランは「。」が無いので、1段落が1単位になる。
-- 「。」の無い段落は、日本語でも1段落が1単位になる（continuo の docs/plans の46本で、いちばん長い単位は検索語を並べた段落の3,026字）。
+- 英語のプランは「。」が無いので、1段落が1単位になる。「。」の無い段落は、日本語でも1段落が1単位になる（continuo の docs/plans の46本で、いちばん長い単位は検索語を並べた段落の3,026字）。
 - 分割は次の形を扱わない: 箇条書きの中で4つ以上字下げした表と見出し（箇条書きの本文につながる）・4つ字下げのコードブロック（段落か箇条書きの本文になる。中の `- ` の行は箇条書きに、```` ``` ```` の行はフェンスの開きになる。評価用の issue245 では十数か所が当たる）・Setext の見出し・行頭に `|` の無い表・YAML の front matter。箇条書きの記号を重ねた行（`- - ```go`・`- > ```go`）で開いたフェンスは開きと見ず、字下げした閉じの行が開きになって、内と外が文書の終わりまで逆になる（記号を1行に1つだけ書けば避けられる）。引用や箇条書きの中で閉じないフェンスは、描画と違って文書の終わりまで `code_line` になる（continuo の docs/plans の46本では0件）。
 - H2 が1つしかないプラン（continuo の計画のコメントなど）では、「同じ H2」の候補の規則がプラン全体を指す（[../idea.md:694-696](../idea.md#L694-L696)）。「冒頭の節」の規則は、目標を冒頭に書く書き方を前提にしている（[../idea.md:704](../idea.md#L704)）。
 - 人間の回答が決定として分類されると、同じ質問がまた出ることがある。
 - 判定役とプランの書き手が同じモデルになることがある（[../idea.md:212](../idea.md#L212)）。
 - 誰が何を言ったか（S1・S4・idea.md 11章）は扱わない。入力は1本のプランに限る（S2・W2）。人間の回答を書き写すときの改変は照合しない。扱う段は [#10](https://github.com/maimuzo/pace/issues/10) の計画で、回答の書き写し方とあわせて決める。
-- plan mode の中では回らないので、プランは plan mode の外で書き、PACE も plan mode の外で起動する使い方に限る（plan mode を出るのは人間の承認なので、出てから回すと「設計を完了させる前」にならない）。[#2](https://github.com/maimuzo/pace/issues/2) で1回ずつ試した（Claude Code 2.1.301、user settings を読まない起動）: plan mode でも `/pace:pace`（`pace.py --version` だけ）は確認なしで通ったが、subagent にジョブを渡すよう手で頼むと、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まった。plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になった。書き込みを伴う pace.py の段（`init`）は、plan mode では試していない。
+- plan mode の中では回らないので、プランは plan mode の外で書き、PACE も plan mode の外で起動する使い方に限る（plan mode を出るのは人間の承認なので、出てから回すと「設計を完了させる前」にならない）。[#2](https://github.com/maimuzo/pace/issues/2) で手で頼んだときも、[#4](https://github.com/maimuzo/pace/issues/4) で skill から呼んだときも（Claude Code 2.1.301）、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まった。#4 では `init` も叩かなかった。plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になる。
 - subagent の書き込みを許す規則（`Edit(**/.pace/**)`。[配り方とプラグインの形](#2-配り方とプラグインの形)）は、プランが Claude Code を起動したディレクトリの下にあるときにしか当たらない見込み（推論。確かめていない）。subagent に限らず、メインのセッションの `.pace/` への書き込みにも効く（公式文書の要約。確かめていない）ので、書き手が `*.out.json` を自分で書いても確認では気づけない。
+- `next` は答えの無いジョブを差し戻しの1回に数えるので、束の結果が返る前に `next` を打つと試行を食い、出し直したジョブの同じ `out_path` に前の subagent が遅れて書いた答えを取り込みうる（SKILL.md の決まりで防ぐだけ）。確認を出すモードで回すには、利用者が settings に `Bash(python3 "<pace.py の絶対パス>" *)` を足す必要がある（許可が subagent の知らせのターンに続かないため。パスは plugin を更新すると変わる）。判定の途中で落ちると、1回多く食うことがある。1件で20,000字を超える分類のジョブ（1単位が長いとき）は、subagent の Read で1回に読めずに失敗したジョブになりうる。束・ジョブの大きさと並列の数は推論の仮の値（14節）。キャッシュの鍵は agent の定義を含むが、鍵が変わらないままモデルが変わる経路が3つある: 環境変数 `CLAUDE_CODE_SUBAGENT_MODEL` での差し替え（2.1.251 より前は `_FORCE` 無しでも効き、以降は `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` と組で効く。README の公式文書の要約）・組織の `availableModels` による置き換え・Claude Code の更新で別名が指すモデルが変わること。どれも pace.py からは知れないので、そのときは `cache/` を空にする。
 - 判定役の `model: opus` が使えるかは、利用者の環境（契約・プロバイダ）ごとに違い、確かめていない。組織の `availableModels` で禁じられていれば、許された版に置き換わるか、親のセッションのモデルで動く（公式文書の要約）。`CLAUDE_CODE_SUBAGENT_MODEL` と `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` で差し替えると、全部の subagent が同じモデルになり、pace-worker と pace-judge の使い分けが消える（公式文書の要約。確かめていない）。
 
 ---
@@ -338,7 +339,7 @@ NEXT: continue
 
 | 受け持つ issue | 論点 |
 | --- | --- |
-| [#4](https://github.com/maimuzo/pace/issues/4) | `*.out.json` を書かなかったジョブを試行に数えるか。キャッシュの鍵に agent の定義やモデルの別名が入らないこと。同じターンの中で pace.py を何度も叩き、間に subagent を挟んでも、`allowed-tools` の許可が続くか（1回叩けることは確かめてある）。ふだんの設定（user settings を読む・subagent が前面で動く）で、subagent の書き込みに確認が出ないか（#2 は user settings を読まない起動・バックグラウンドの subagent で確かめた）。skill から subagent を呼ばせる形で、plan mode の中で回らないことを確かめ直す（#2 は手で頼んだ1回だけ）。回ると分かったら、`init` の書き込みと `~/.claude/plans/` のプランへの規則の当たり方も確かめる |
+| [#6](https://github.com/maimuzo/pace/issues/6) | 分類か裁定が失敗した単位（ノードが無い）を候補に含む決定の扱い。その単位の前提が候補に出ないので、決定が gap で止まり fixes に見えうる。`failed_jobs.jsonl` の `units` から辿る |
 | [#7](https://github.com/maimuzo/pace/issues/7) | 書き手のプランの Edit・注記の Edit・ターンのあとの `shown`・回答のあとに書き手が起動し直した skill・`--no-ask` で呼ばれたときに、権限の確認が出ないか。show.md のコードブロックがプランの中の ``` で閉じる。errors のときに古い show_snapshot.md が残る。「最後に見せてから何周か」と「初回」を判定する記録の置き場所。`--no-ask` のときの決まり3と伏せ処理の上下・0 以外で終わったときに返すもの。決まり4の範囲・注記の問いと質問の重なり・show.md の中のパスの基準。init が `NEXT: show` を出したときの分かれ道・停止の条件の書き分け・性質4と5の show.md の形。境目の行の形と、show.md・questions.md・report.md・`--no-ask` が返すものの見本。決まり3・4を pace.py で確かめるか（境目より前の sha256 など）。fixes と questions を何の単位で数えるか（gap ごとか、決定ごとか） |
 | [#9](https://github.com/maimuzo/pace/issues/9) | 「公開してよいか分からない中身は書かない」で質問が増えすぎないか。限界の節のうち、作り込むものの判断 |
 | [#10](https://github.com/maimuzo/pace/issues/10) | `--no-ask` で返すものを公開のコメントへ写すときの伏せ方 |
@@ -363,3 +364,36 @@ NEXT: continue
 
 - 各 issue は、その計画で決めた細部をこの文書の該当の節へ書き足す。400行・1節50行の上限はこの版に当て、超えそうになったら節を分ける。
 - カンバンへの配置は、#1 の run でオーナーの指示（「全てice boxレーンに入れて、実装順序になるように並び替えておけ」）による例外として、AI が行った。この PR のレビューで表が変わったときは、同じ run の中で同じ置き方で直す。そのあとの並べ替えと、表から外れた issue を閉じることは、人間が決める。
+
+---
+
+## 14. ジョブと束（next）
+
+**言いたいこと。**`next` は1回ごとに「出したジョブの答えを判定する → ジョブの残る段で止まり、残りを束にして最大4束を出す」を行い、全部の段を通ったら `nodes.jsonl` を書いて `DONE` を出す（[#4](https://github.com/maimuzo/pace/issues/4)）。判定の元はジョブファイルの `status` だけで、`pending.json` はいまの波の記録である。ジョブは `indent=1`・`ensure_ascii=False` で書く（日本語を `\uXXXX` にすると字数とトークンが数倍になる）。SKILL.md は `BUNDLE` ごとに Agent を1回呼び（`subagent_type` はその行の agent、model は渡さず、渡す文は「次のジョブファイルを、書いてある順に1件ずつ処理してください」と `JOB` のパスだけ）、1つの波の束を並列に呼んで全部の結果が返ってから次の `next` を打つ。エラーで返った束があれば `next` を打たずに止まる（試行は食わないが、起動し直すとその波の答えは消える）。`init` が `errors=1` を出したら `next` を打たずに止まる（仮の扱いで、[#7](https://github.com/maimuzo/pace/issues/7) で決め直す）。
+
+```text
+BUNDLE b001 pace:pace-worker
+JOB /home/u/proj/docs/plans/.pace/plan/jobs/classify/classify_A_001_7f3a9c21.json
+WAVE bundles=1 jobs=1
+# ↑ 波を出す next の出力。尽きた next は DONE decisions=49 premises=37 failed_jobs=0 の1行だけ。↓ ジョブファイル（実物は indent=1）
+{"job_id": "classify_A_001_7f3a9c21", "stage": "classify", "variant": "A", "cache_key": "", "prompt_version": "2026-10-16.1", "instructions": "…", "input": {"units": [{"uid": "u2e8b33e5", "kind": "sentence", "section_path": ["題", "節"], "text": "…", "neighbors": ["…"]}]}, "out_path": "/home/u/…/classify_A_001_7f3a9c21.out.json", "attempts": 0, "previous_errors": [], "status": "issued"}
+```
+
+| 決めたこと | 根拠 |
+| --- | --- |
+| 段は分類（A と B）→ 比較 → 裁定 → ノード化。`nodes.jsonl` の1行は `{"id","kind","ptype"(前提だけ),"text","alternatives"(決定だけ),"unit","line","sec","path"}` で、ID は `D_<uid の u を除いたもの>_<単位の中の決定の連番>`・`P_…`。原文は持たず `unit` で単位を指し、`text` は AI の言い換え。分類と裁定はジョブを作り、比較とノード化はその場で進む。段を前から見て、`pending` か `issued` のジョブが残る段で止める。キャッシュが全部当たって0件の段は通り抜ける | 1回に1段だけ進めると、0件の段のあとで裁定を通らずに終わる |
+| 段のジョブを全部書いたら、最後に `jobs/<段>/created.json`（周の印・ジョブの ID の列）を書く。印が無い段は消して作り直す。ジョブとして数えるのは列にある `<job_id>.json` だけ。周の印は `init` のあと最初の `next` が決める8桁の乱数（`jobs/round.json`）で、ジョブの名前に入れる。ノード化の前に、どの単位にも分類の A と B の答え（食い違ったものは裁定の答え）か `failed_jobs.jsonl` の記録があるかを確かめ、無ければ `init` を打ち直すよう出して 1 で終わる | 作る途中で落ちた段と、前の起動の subagent が遅れて書いた答え（前の周の名前に落ちる）を取り込まない。拾い漏れを `failed_jobs=0` の成功に見せない |
+| 分類は節ごとに30単位まで、かつジョブファイルが作った時点で20,000字まで（差し戻しの理由は1件300字で切るが、出すジョブでは最大3件ぶん増え、制御文字は JSON のエスケープで膨らむ）。各単位に `uid`・`kind`・`section_path`・`text`・前後2単位の本文を付け、B は単位の順を逆にする。裁定は1件1単位で、同じものに A と B のラベルを足す。指示文は idea.md 付録A に code_line の1行を足し、裁定には「section_path と neighbors で文脈を確かめること」の1文も足したもの（裁定にも同じ文脈を渡すため） | subagent の Read が1回で読める大きさに収める。`kind` が無いとコードの行と文を見分けられない |
+| 束はジョブファイルの合計（指示文を含む）で60,000字まで・20ジョブまで。分類の A と B は別の束にし、交互に並べて1つの波に4束まで出す。1件で上限を超えるジョブは1件だけの束にする | 固定分約7万トークンに入力約6万・答え1〜2万を足しても200k に収まる見込み（推論）。A と B を同じ subagent が続けて読むと独立な2回の判断にならない（[../idea.md:317](../idea.md#L317) の原則6）。値は [#9](https://github.com/maimuzo/pace/issues/9) で測り直す |
+| 答えはふつうのファイル（symlink でない）の JSON のオブジェクト。分類は入力の全ての uid が過不足なく1回ずつ、`labels` は空でよい。ラベルは `decision`（`text` と1つ以上の `alternatives`）か `premise`（`ptype` が fact / requirement / value と `text`）。知らないキーは捨てる | AI の出力を必ず機械で検証する（[../idea.md:318](../idea.md#L318)） |
+| 落ちた答えは `<job_id>.rejected-<n>.json`（`n` は増やしたあとの `attempts`。1から）に名前を変え、`attempts` を増やし理由を `previous_errors` に足して出し直す。答えが無いジョブも1回に数える。`attempts` が3のときにまた落ちたら（差し戻し3回のあと）、`failed_jobs.jsonl` に `{"job_id","stage","units","errors"}` を書いて失敗にし、同じ周では出し直さない。失敗した単位はノードを作らない。書く順: 波を出すときはジョブを `issued` にしてから `pending.json` を書いて出力する。通ったらキャッシュに書いてから `done`。落ちたら名前を変えてから `attempts` を増やす。失敗は記録を書いてから `failed`（記録は job_id で重ねない） | 同じ名前で残すと同じ答えを検証し直す。答えの無いジョブを数えないと `next` が尽きない。失敗はキャッシュに入らないので、次の周で最初から出し直す。途中で落ちても、同じ答えを検証し直すか、試行を1回多く食うだけで済む |
+| キャッシュの鍵は sha256（段の名前・段の版・指示文の sha256・段の agent の定義ファイルの sha256・入力の鍵）。分類の入力の鍵は A/B・元のプランのファイル名・節・uid・kind・section_path・text、裁定は kind・section_path・text・A と B のラベル。前後の文は入れない。`cache/<鍵>.json` に `{"labels": [...]}` を置く | 前後の文を入れると1行の修正が周りへ揺れる（[../idea.md:515-528](../idea.md#L515-L528)）。agent の定義（frontmatter の model を含む）を変えたら答えを作り直す |
+| `next` が 1 で終わるのは、プランを読めない・`plan.md` が無い・`units.jsonl` が無いか、いまのプランを分けた単位と違う（書き換えられたか、分割の規則が変わったのに `init` を打っていない）・`init` のあとにプランが変わった・作業ディレクトリが使えない（`cache/`・`jobs/` が symlink を含む）・作業ディレクトリのファイルが壊れているか形が違う・網羅の欠け・agent の定義を読めない・答えを待っているジョブがある・書けない、のとき。`cache/` の答えが壊れているか形が違うときは、答えが無いものとしてジョブを作り直す（`init` が `cache/` を残すので、打ち直しでは直らないため）。`nodes.jsonl` は `next` が作業ディレクトリを確かめたらすぐ消し、`DONE` のときだけ書く。ジョブファイルの `job_id`・`out_path`・`cache_key`・`variant` は使わず、`created.json` の列の ID（形を確かめる）・段のディレクトリ・プランから分け直した単位から作り直す。単位はプランから分け直し、`units.jsonl` と同じであることを確かめる（ノードは `unit` で `units.jsonl` の単位を指す）。失敗した単位と `failed_jobs` の数はジョブの `status` から数え、`failed_jobs.jsonl` は理由を読むための記録にする（偽の記録で単位を外させない。1行は `ensure_ascii` で書く）（ジョブファイルは `Edit(**/.pace/**)` で書き換えられうるので、作業ディレクトリの外を指させない）。UTF-8 で書けない字を含む答えは検証に落とす。errors には数えない | プランを読めないことを errors に数えるのは `init` だけにする（[パイプライン](#5-パイプライン)） |
+
+**#2 から移した論点の答え（2026-10-16、Claude Code 2.1.301、herdr の pane で起動、`--permission-mode manual`、user settings を読む起動。user settings に Bash・Edit・Write・Agent を許す規則は無かった）。**
+- **同じターンの中の許可**: `/pace:pace` を打ったターンの中では、`init`・`next`・最初の波の Agent の呼び出しまで確認なしで進んだ。subagent は既定でバックグラウンドで動き、完了の知らせが新しいターンとして届き、そこで打った `next` に Bash の確認が出た（skill の `allowed-tools` の許可は、知らせで始まったターンには続かない）。Agent の呼び出しに前面で動かす選び方は無く、前面では確かめられなかった。確かめ用のディレクトリの `.claude/settings.local.json` に規則を足すと、確認なしで `DONE` まで回った（`Bash(python3 *scripts/pace.py*)` で2本、pace.py の絶対パスを書いた `Bash(python3 "<pace.py の絶対パス>" *)` で issue224 の写し。README には後者を書く）。
+- **subagent の書き込み**: `Edit(**/.pace/**)` を足した状態で、pace-worker と pace-judge の書き込みに確認は出なかった（バックグラウンド）。
+- **完了条件の2本**: issue224（89単位）は分類2束・裁定1束の3回の呼び出しで `DONE decisions=49 premises=37 failed_jobs=0`（約3分）。issue134_136_140（932単位）は分類84ジョブを26束（7波）、裁定124ジョブを7束（2波）の33回で `DONE decisions=577 premises=263 failed_jobs=0`（約15分。1ジョブ1回なら208回）。差し戻しは0件。subagent の記録で、呼び出しごとの文脈の最大は pace-worker（sonnet）で21k〜61kトークン、pace-judge（opus）で14k〜49kトークン、答えは2k〜13kトークンだった（文脈の 200k トークンに対して余裕がある。[../idea.md:601](../idea.md#L601) の「約7万トークンの固定分」はこの観測より大きく、数え方の違いか前提の外れかは #9 で確かめる。[#9](https://github.com/maimuzo/pace/issues/9) で束を大きくするかを決める）。
+- **plan mode**: `--permission-mode plan` で `/pace:pace` を打つと、`init` も叩かずにプランを書き、plan mode を抜けてよいかの確認で止まった。回らないので、`~/.claude/plans/` のプランへの規則の当たり方は確かめていない。
+
+**退けた案。****束を渡し直す**（エラーで返った束を同じ波でもう1回渡す）: 答えのあるジョブを飛ばさせると、agent の規則「他のジョブの結果は開かない」とぶつかる。**段の違うジョブを同じ束に入れない決まり**も持たない（ジョブの残る段で止めるので、そもそも同じ波に出ない）。
