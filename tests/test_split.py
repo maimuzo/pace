@@ -92,6 +92,8 @@ class JoinTest(unittest.TestCase):
         self.assertEqual([(u["kind"], u["text"], u["line"]) for u in split("1.\n  本文")], [("bullet", "本文", 1)])
 
     def test_four_space_indent_is_continuation(self):
+        # 開いている段落にはつながり、空行のあとでは新しい段落になる（4つ字下げのコードブロックは扱わない）
+        self.assertEqual(kinds_texts("本文\n    続き"), [("sentence", "本文続き")])
         self.assertEqual(kinds_texts("本文\n\n    {\"a\": 1}"), [("sentence", "本文"), ("sentence", "{\"a\": 1}")])
 
     def test_line_of_second_sentence(self):
@@ -187,6 +189,16 @@ class FenceTest(unittest.TestCase):
     def test_code_line_is_not_normalized(self):
         self.assertEqual(kinds_texts("```\n    f(**kwargs,   x)   \n```"), [("code_line", "    f(**kwargs,   x)")])
 
+    def test_fence_on_bullet_line(self):
+        text = "- ```go\n  x := 1\n  ```\n\n## 次の節\n\n本文。\n\n1. ~~~\n   y\n   ~~~\n後。"
+        self.assertEqual(kinds_texts(text), [
+            ("code_line", "  x := 1"),
+            ("heading", "次の節"),
+            ("sentence", "本文。"),
+            ("code_line", "   y"),
+            ("sentence", "後。"),
+        ])
+
     def test_blank_lines_in_fence_are_dropped(self):
         self.assertEqual(kinds_texts("```\na\n\n   \nb\n```"), [("code_line", "a"), ("code_line", "b")])
 
@@ -199,7 +211,10 @@ class SpeedTest(unittest.TestCase):
         import time
         start = time.monotonic()
         split("。\n".join(["文"] * 20000) + "\n" + "`a`**" * 20000)
-        self.assertLess(time.monotonic() - start, 3.0)
+        split("a" + "*" * 400000 + "\nb")
+        split("# a" + " " * 20000 + "b")
+        # 2乗の版では同じ入力で十数秒かかる。線形の版は1秒に届かない
+        self.assertLess(time.monotonic() - start, 10.0)
 
 
 class SentenceTest(unittest.TestCase):

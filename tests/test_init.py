@@ -202,6 +202,26 @@ class InitTest(unittest.TestCase):
         self.assertEqual(self.init(plan).returncode, 0)
         self.assertTrue((self.pace / ".md" / "units.jsonl").exists())
 
+    def test_symlink_loop_is_unreadable(self):
+        loop = self.dir / "loop.md"
+        os.symlink(str(loop), str(loop))
+        r = self.init(loop)
+        self.assertEqual((r.returncode, r.stdout), (0, UNREADABLE))
+
+    def test_source_json_that_is_not_a_regular_file(self):
+        self.init()
+        source = self.work / "source.json"
+        source.unlink()
+        os.mkfifo(str(source))
+        r = subprocess.run([sys.executable, str(PACE), "init", str(self.plan)], capture_output=True, text=True,
+                           timeout=10)
+        self.assertEqual(r.returncode, 1)
+        source.unlink()
+        source.write_text("[" * 100000 + "]" * 100000)
+        r = self.init()
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_fifo_is_unreadable(self):
         fifo = self.dir / "pipe.md"
         os.mkfifo(str(fifo))

@@ -9,6 +9,7 @@ docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ�
 
 import argparse
 import bisect
+import errno
 import hashlib
 import json
 import os
@@ -51,7 +52,6 @@ LINE_END = re.compile(r"\r\n|\r|\n")
 QUOTE_MARK = re.compile(r"[ \t]*>[ \t]?")
 FENCE_OPEN = re.compile(r"[ \t]*(`{3,}|~{3,})(.*)")
 HEADING = re.compile(r"[ \t]{0,3}(#{1,6})(?:[ \t]+(.*))?")
-HEADING_CLOSE = re.compile(r"[ \t]+#+[ \t]*$")
 RULE = re.compile(r"[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
 TABLE = re.compile(r"[ \t]{0,3}\|")
 TABLE_SEPARATOR = re.compile(r":?-+:?")
@@ -73,6 +73,17 @@ def strip_quote(line, limit=None):
         rest = rest[m.end():]
         depth += 1
     return depth, rest
+
+
+def strip_closing_hashes(title):
+    """見出しの末尾の # の並びを、前に空白があるか本文が # だけのときに外す（正規表現の後戻りを避ける）。"""
+    body = title.rstrip(" \t")
+    head = body.rstrip("#")
+    if head == body:
+        return title
+    if head == "" or head[-1] in " \t":
+        return head
+    return title
 
 
 def code_spans(text):
@@ -131,13 +142,10 @@ def join_pieces(pieces):
         # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる。
         # 端の ** はあとで外すので、その内側の字で決める（「**重要**」で折り返しても本文を変えない）
         if raw:
-            last, first = raw, piece
-            while last.endswith("**"):
-                last = last[:-2]
-            while first.startswith("**"):
-                first = first[2:]
-            last = last[-1:] or raw[-1]
-            first = first[:1] or piece[0]
+            stars = len(raw) - len(raw.rstrip("*"))
+            last = raw[:len(raw) - stars + stars % 2][-1:] or raw[-1]
+            stars = len(piece) - len(piece.lstrip("*"))
+            first = piece[stars - stars % 2:][:1] or piece[0]
             if ord(last) < 128 or ord(first) < 128:
                 raw += " "
         starts.append((len(raw), line_no))
@@ -283,7 +291,7 @@ def split_units(text):
             close_block()
             level = len(m.group(1))
             title = m.group(2) or ""
-            title = "" if re.fullmatch(r"#+[ \t]*", title) else HEADING_CLOSE.sub("", title)
+            title = strip_closing_hashes(title)
             title = normalize(title)
             if not title:
                 # 本文の無い見出しは、単位にも文書の構造にもしない
@@ -317,6 +325,14 @@ def split_units(text):
             continue
 
         m = BULLET.fullmatch(rest)
+        if m and FENCE_OPEN.fullmatch(m.group(1) or ""):
+            f = FENCE_OPEN.fullmatch(m.group(1))
+            if not (f.group(1)[0] == "`" and "`" in f.group(2)):
+                # 箇条書きの記号と同じ行で開いたフェンス（`- ```go`）。開きを見落とすと、
+                # 字下げした閉じの行が開きになって、内と外が文書の終わりまで逆になる
+                close_block()
+                fence = {"char": f.group(1)[0], "width": len(f.group(1)), "depth": depth}
+                continue
         if m:
             close_block()
             block = {"kind": "bullet", "depth": depth, "pieces": [(line_no, m.group(1) or "")]}
@@ -356,6 +372,9 @@ def read_plan(plan):
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return None
     except OSError as e:
+        if e.errno == errno.ELOOP:
+            # 輪になった symlink は、行き先の無い symlink と同じく「無い」と数える
+            return None
         raise PaceError("プランを読めませんでした（%s）: %s" % (e.strerror or e, plan))
     try:
         return data, data.decode("utf-8-sig")
@@ -386,11 +405,14 @@ def check_dir(path):
 def check_owner(plan, work):
     """作業ディレクトリが別のプランのものなら PaceError。source.json が無ければ、いまのプランのものとする。"""
     source = work / "source.json"
-    if not source.exists():
+    if not source.exists() and not source.is_symlink():
         return
     try:
+        if source.is_symlink() or not stat.S_ISREG(source.stat().st_mode):
+            # FIFO を読むと戻らない。symlink は作業ディレクトリの外を読みうる
+            raise ValueError("ふつうのファイルではありません")
         recorded = json.loads(source.read_text(encoding="utf-8")).get("plan_file")
-    except (OSError, ValueError, AttributeError) as e:
+    except (OSError, ValueError, AttributeError, RecursionError) as e:
         raise PaceError("%s を読めないので、何も書きません（%s）" % (source, e))
     if not isinstance(recorded, str) or recorded in ("", ".", "..") or os.path.basename(recorded) != recorded:
         raise PaceError("%s の plan_file がファイル名ではないので、何も書きません" % source)
@@ -459,14 +481,14 @@ def init(plan_arg):
         print("NEXT: show")
         return 0
     data, text = read
-    try:
-        source = (json.dumps({"plan_file": plan.name}, ensure_ascii=False) + "\n").encode("utf-8")
-    except UnicodeEncodeError:
-        raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     pace_dir, work = workdir_for(plan)
     check_dir(pace_dir)
     check_dir(work)
     check_owner(plan, work)
+    try:
+        source = (json.dumps({"plan_file": plan.name}, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     units = split_units(text)
     try:
         pace_dir.mkdir(exist_ok=True)
@@ -480,7 +502,7 @@ def init(plan_arg):
         if not (work / "shown.md").exists():
             write_atomic(work / "shown.md", data)
     except OSError as e:
-        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, work))
+        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     print("units=%d" % len(units))
     return 0
 
