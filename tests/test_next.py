@@ -543,10 +543,64 @@ class NextTest(unittest.TestCase):
 
     def test_long_errors_are_cut(self):
         bundles, job = self.first_job()
-        self.write_answer(job, json.dumps({"units": [{"uid": "u%08d" % i, "labels": []} for i in range(200)]}))
+        self.write_answer(job, json.dumps({"units": [{"uid": "u" + "x" * 2000, "labels": []}]}))
         self.next()
         errs = self.reload(job)["previous_errors"]
-        self.assertTrue(errs and all(len(e) <= pace.ERROR_MAX_CHARS + 1 for e in errs))
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(len(errs[0]), pace.ERROR_MAX_CHARS + 1)
+        self.assertTrue(errs[0].endswith("…"))
+
+    def test_surrogates_in_answers_are_sent_back(self):
+        """対のない surrogate（JSON の "\\ud83d"）を含む答えは、差し戻して、4回目に失敗したジョブにする。"""
+        for mode in ("text", "uid"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                bundles, job = self.first_job()
+                uids = [u["uid"] for u in job["input"]["units"]]
+                if mode == "text":
+                    items = [{"uid": u, "labels": [decision("SURROGATE")]} for u in uids]
+                else:
+                    items = [{"uid": "SURROGATE", "labels": []}]
+                # json.dumps は surrogate をそのまま書けないので、印を JSON のエスケープに置き換える
+                text = json.dumps({"units": items}).replace("SURROGATE", "\\ud83d")
+                for n in range(1, 5):
+                    Path(job["out_path"]).write_text(text, encoding="utf-8")
+                    r = self.next()
+                    self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(self.reload(job)["status"], "failed")
+
+    def test_tampered_job_cannot_touch_outside(self):
+        bundles, job = self.first_job()
+        outside = self.dir / "src.py"
+        outside.write_text("print(1)\n", encoding="utf-8")
+        path = self.work / "jobs" / "classify" / (job["job_id"] + ".json")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["out_path"] = str(outside)
+        raw["job_id"] = "../../../../escaped"
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        r = self.next()
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "print(1)\n")
+        self.assertFalse(list(self.dir.glob("escaped*")))
+        self.assertEqual(self.reload(job)["attempts"], 1)
+
+    def test_tampered_job_input_stops(self):
+        bundles, job = self.first_job()
+        path = self.work / "jobs" / "classify" / (job["job_id"] + ".json")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["input"] = {}
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_old_nodes_removed_when_plan_changed(self):
+        self.init()
+        self.drive()
+        self.plan.write_text(PLAN + "足した。\n", encoding="utf-8")
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse((self.work / "nodes.jsonl").exists())
 
     def test_agent_definition_file_changes_key(self):
         self.init()

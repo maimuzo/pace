@@ -578,7 +578,7 @@ STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge"}
 JOB_STAGES = ("classify", "adjudicate")
 PTYPES = ("fact", "requirement", "value")
 
-# 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足したもの。
+# 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足し、裁定には文脈を確かめる1文を足したもの。
 # 変えるとキャッシュの鍵（指示文の sha256）が変わるので、古い答えは使われない。出力の形を変えたら段の版も上げる
 INSTRUCTIONS = {
     "classify": """あなたは設計プランの文を分類する。input.units の各単位（文・箇条書き・表の1行・見出し・コードの1行）に、次のラベルを付けよ。単位の種類は kind にあり、code_line はコードブロックの中の1行である。
@@ -616,8 +616,9 @@ def read_regular(path):
 def load_work_json(path, valid=lambda obj: True):
     """作業ディレクトリの中の、pace.py が書いた JSON を読む。
 
-    読めないか、valid が偽を返す形なら PaceError（init を打ち直す案内）。init で消えるファイルにだけ使う
-    （init が残す cache/ は、壊れていたら答えが無いものとして作り直す。cache_get）。
+    読めないか、valid が偽を返す形なら PaceError（init を打ち直す案内）。init で消えるファイルと、
+    check_owner が先に確かめた source.json にだけ使う（init が残す cache/ は、壊れていたら答えが無いものとして
+    作り直す。cache_get）。
     """
     try:
         obj = json.loads(read_regular(path).decode("utf-8"))
@@ -634,10 +635,31 @@ def is_str_list(obj):
 
 
 def valid_job(obj):
-    return (isinstance(obj, dict) and obj.get("stage") in JOB_STAGES and isinstance(obj.get("job_id"), str)
-            and isinstance(obj.get("attempts"), int) and is_str_list(obj.get("previous_errors"))
-            and isinstance(obj.get("out_path"), str) and isinstance(obj.get("input"), dict)
-            and obj.get("status") in ("pending", "issued", "done", "failed"))
+    """ジョブファイルの形。中の値（uid と cache_key）まで見る。
+
+    out_path と job_id はファイルの値を使わず、段のディレクトリと created.json の列から作り直す
+    （ジョブファイルは Edit(**/.pace/**) の許可で書き換えられうるので、作業ディレクトリの外を指させない）。
+    """
+    if not (isinstance(obj, dict) and obj.get("stage") in JOB_STAGES and isinstance(obj.get("attempts"), int)
+            and is_str_list(obj.get("previous_errors")) and isinstance(obj.get("input"), dict)
+            and obj.get("status") in ("pending", "issued", "done", "failed")):
+        return False
+    if obj["stage"] == "classify":
+        units = obj["input"].get("units")
+        return isinstance(units, list) and bool(units) and all(
+            isinstance(u, dict) and isinstance(u.get("uid"), str) and isinstance(u.get("cache_key"), str)
+            for u in units)
+    unit = obj["input"].get("unit")
+    return isinstance(unit, dict) and isinstance(unit.get("uid"), str) and isinstance(obj.get("cache_key"), str)
+
+
+def encodable(text):
+    """UTF-8 で書ける文字列か（対のない surrogate を含む AI の答えは、キャッシュにもジョブにも書けない）。"""
+    try:
+        text.encode("utf-8")
+        return True
+    except UnicodeEncodeError:
+        return False
 
 
 # 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
@@ -658,11 +680,12 @@ def check_label(label, where):
         raise ValueError("%s のラベルがオブジェクトではありません" % where)
     kind = label.get("kind")
     text = label.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError("%s のラベルの text が空でない文字列ではありません" % where)
+    if not isinstance(text, str) or not text.strip() or not encodable(text):
+        raise ValueError("%s のラベルの text が空でない文字列ではありません（UTF-8 で書けない字も含めない）" % where)
     if kind == "decision":
         alts = label.get("alternatives")
-        if not isinstance(alts, list) or not alts or not all(isinstance(a, str) and a.strip() for a in alts):
+        if not isinstance(alts, list) or not alts or not all(isinstance(a, str) and a.strip() and encodable(a)
+                                                             for a in alts):
             raise ValueError("%s の decision の alternatives が、空でない文字列1つ以上の配列ではありません" % where)
         return {"kind": "decision", "text": text, "alternatives": list(alts)}
     if kind == "premise":
@@ -728,6 +751,14 @@ class Round:
             check_dir(self.cache_dir)
         except OSError as e:
             raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or self.work))
+        # nodes.jsonl は DONE のときだけ書く。前の DONE のものを残すと、プランが変わった・網羅が欠けたなどで
+        # 1 で終わったあとも古いノードを後の段が読むので、作業ディレクトリを確かめたらすぐ消す
+        nodes_path = self.work / "nodes.jsonl"
+        try:
+            if os.path.lexists(str(nodes_path)):
+                os.unlink(str(nodes_path))
+        except OSError as e:
+            raise PaceError("%s を消せませんでした（%s）" % (nodes_path, e.strerror or e))
         for name in ("units.jsonl", "plan.md"):
             if not os.path.lexists(str(self.work / name)):
                 raise PaceError("%s がありません。init を打ってください" % (self.work / name))
@@ -835,7 +866,12 @@ class Round:
         return self.stage_dir(stage) / (job_id + ".json")
 
     def load_job(self, stage, job_id):
-        return load_work_json(self.job_path(stage, job_id), valid_job)
+        """列の ID のジョブを読む。job_id と out_path は、ファイルの値でなく段のディレクトリと ID から決める。"""
+        path = self.job_path(stage, job_id)
+        job = load_work_json(path, lambda o: valid_job(o) and o["stage"] == stage)
+        job["job_id"] = job_id
+        job["out_path"] = str((self.stage_dir(stage) / (job_id + ".out.json")).absolute())
+        return job
 
     def new_job(self, stage, job_id, job_input, cache_key="", variant=None):
         d = self.stage_dir(stage)
@@ -973,6 +1009,8 @@ class Round:
             # 古い答えの名前を変えてから attempts を増やす（同じ名前で残すと、次の next が同じ答えを検証し直す）
             os.replace(str(out), str(out.parent / ("%s.rejected-%d.json" % (job["job_id"], n))))
         job["attempts"] = n
+        # AI の答えの uid などに UTF-8 で書けない字があっても、理由をジョブと記録に書けるようにする
+        error = error.encode("utf-8", "backslashreplace").decode("utf-8")
         if len(error) > ERROR_MAX_CHARS:
             error = error[:ERROR_MAX_CHARS] + "…"
         job["previous_errors"].append(error)
@@ -984,7 +1022,7 @@ class Round:
                 rec = {"job_id": job["job_id"], "stage": stage, "units": units, "errors": job["previous_errors"]}
                 path_f = self.work / "failed_jobs.jsonl"
                 old = read_regular(path_f) if os.path.lexists(str(path_f)) else b""
-                line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+                line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8", "backslashreplace")
                 write_atomic(path_f, old + line, PRIVATE_FILE)
             job["status"] = "failed"
         else:
@@ -1069,11 +1107,6 @@ class Round:
         return result
 
     def run(self):
-        # nodes.jsonl は DONE のときだけ書き直す。前の DONE のものを残すと、網羅が欠けて 1 で終わったあとも
-        # 古いノードを後の段が読むので、ほかの何より先に消す
-        nodes_path = self.work / "nodes.jsonl"
-        if os.path.lexists(str(nodes_path)):
-            os.unlink(str(nodes_path))
         rid = self.round_id()
         # (1) issued のジョブだけを判定する
         for stage in JOB_STAGES:
