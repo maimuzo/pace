@@ -40,6 +40,8 @@ claude plugin update pace@pace
 claude --plugin-dir <checkout>/plugins/pace
 ```
 
+次の2つの形は、どちらも marketplace の名前が `pace` になります。GitHub の main から入れた `pace` が既にあるときは名前がぶつかる見込みなので（確かめていません）、先に `claude plugin marketplace remove pace` で外してください。そこから入れた plugin も使えなくなるので、試し終えたら「入れ方」のとおりに入れ直してください。
+
 push 済みの branch から入れるなら、次の形で入れられました（2.1.301 で確かめました）。`--scope local` にすると、いまのディレクトリの設定にだけ入ります。
 
 ```bash
@@ -54,14 +56,19 @@ claude plugin marketplace add <checkout のパス>
 claude plugin install pace@pace
 ```
 
-入れたものは plugin の cache（commit の sha のディレクトリ）に写ります。編集を反映するには、commit して（branch の形なら push もして）、入れたときと同じ scope で更新します。
+入れたものは plugin の cache（commit の sha のディレクトリ）に写ります。編集を反映するには、commit して（branch の形なら push もして）から次を叩き、Claude Code を起動し直します（`claude plugin update` は、入れた scope を自分で見つけます）。
 
 ```bash
 claude plugin marketplace update pace
-claude plugin update pace@pace --scope local
+claude plugin update pace@pace
 ```
 
-どちらの形でも marketplace の名前は `pace` なので、GitHub の main から入れた `pace` が既にあるときは名前がぶつかります。先に `claude plugin marketplace remove pace` で外してください（そこから入れた plugin も使えなくなります）。
+試し終えたら外します（branch の形の例。checkout の形で入れたときは `--scope local` を付けません）。
+
+```bash
+claude plugin uninstall pace@pace --scope local
+claude plugin marketplace remove pace --scope local
+```
 
 ## 権限の設定
 

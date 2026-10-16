@@ -54,6 +54,7 @@ sequenceDiagram
 - 書き手が決まりを守ったか、事実の出どころが実在するかは、機械では確かめない。人間に見せる差分と注意で補う。
 - plan mode の中では回らない。プランは plan mode の外で書き、PACE も plan mode の外で起動する（[#2](https://github.com/maimuzo/pace/issues/2) で1回試して判断した。skill から subagent を呼ばせる形ができたら確かめ直す）。
 - 判定役の `opus` が使えるかは、利用者の環境ごとに違い、確かめていない。
+- subagent の書き込みを許す規則（`Edit(**/.pace/**)`）は、プランが Claude Code を起動したディレクトリの下にあるときにしか当たらない見込み。メインのセッションの書き込みにも効くので、書き手が `*.out.json` を自分で書いても確認の画面では気づけない。
 - 別の文書にある根拠は gap として出る。使ってみてから作り込むかを決める（[#9](https://github.com/maimuzo/pace/issues/9)）。
 - 誰が何を言ったか（発言者の扱い）は扱わない。扱う段は、回答の書き写し方とあわせて [#10](https://github.com/maimuzo/pace/issues/10) で決める。
 
