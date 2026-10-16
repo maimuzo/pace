@@ -8,9 +8,9 @@ AI が書いた設計プランから根拠のグラフを作り、根拠の無�
 
 ## 前提
 
-- macOS か Linux
+- macOS か Linux（確かめたのは macOS だけです）
 - Python 3.9 以上（標準ライブラリだけを使います。macOS の Command Line Tools の `python3` で動きます）
-- Claude Code
+- Claude Code（確かめたのは 2.1.301 です。この README の権限とモデルの話は、この版の振る舞いです）
 
 ## 入れ方
 
@@ -32,40 +32,51 @@ claude plugin update pace@pace
 
 `plugin.json` に version を書いていないので、版は commit の sha で決まります。
 
-## 手元の checkout から試す（マージ前）
+## 手元から試す（マージ前）
 
-試すだけなら、入れずにそのセッションだけ読み込みます。同じ名前の、入っている plugin は置き換えられます。編集はセッションを起動し直すと効きます。
+試すだけなら、入れずにそのセッションだけ読み込みます。同じ名前の、入っている plugin は置き換えられます（公式文書の要約）。
 
 ```bash
 claude --plugin-dir <checkout>/plugins/pace
 ```
 
-入れて試すなら、checkout のパスを marketplace にします（この手順そのものは確かめていません）。
+push 済みの branch から入れるなら、次の形で入れられました（2.1.301 で確かめました）。`--scope local` にすると、いまのディレクトリの設定にだけ入ります。
+
+```bash
+claude plugin marketplace add 'maimuzo/pace#<branch 名>' --scope local
+claude plugin install pace@pace --scope local
+```
+
+checkout のパスを marketplace にして入れる形もあります（この手順そのものは確かめていません）。
 
 ```bash
 claude plugin marketplace add <checkout のパス>
 claude plugin install pace@pace
 ```
 
-入れたものは plugin の cache に写るので、編集を反映するには commit と、上の「更新」の2つのコマンドが要ることがあります。
+入れたものは plugin の cache（commit の sha のディレクトリ）に写るので、編集を反映するには commit と、上の「更新」の2つのコマンドが要ることがあります。
 GitHub から入れた `pace` の marketplace が既にあるときは名前がぶつかるので、先に `claude plugin marketplace remove pace` で外してください。
 
 ## 権限の設定
 
-**pace.py（Bash）。**`/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。skill を起動したターンの間は、確認なしで叩けます。
-次に人間が発言すると、この許可は消えます。
+**pace.py（Bash）**
 
-**subagent の書き込み（Write）。**PACE は、実行役の subagent（`pace:pace-worker` と `pace:pace-judge`）にジョブを渡し、答えをプランの隣の `.pace/` の下へ書かせます。
-確認を出すモードでは、書き込みごとに確認が出る見込みです（公式文書の要約による。確かめてはいません）。確認を出したくないときは、プロジェクトの `.claude/settings.local.json` か `.claude/settings.json` に次を足してください。
+`/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。skill を起動したターンの間は、確認なしで叩けます。
+次に人間が発言すると、この許可は消えます（公式文書の要約）。
+
+**subagent の書き込み（Write）**
+
+後の版の PACE は、実行役の subagent（`pace:pace-worker` と `pace:pace-judge`）にジョブを渡し、答えをプランの隣の `.pace/` の下へ書かせます（いまの版は、まだ subagent を呼びません）。
+確認を出すモードでは、書き込みごとに確認が出る見込みです（公式文書の要約。確かめていません）。確認を出したくないときは、プロジェクトの `.claude/settings.local.json` か `.claude/settings.json` に次を足してください。
 
 ```json
 {"permissions": {"allow": ["Edit(**/.pace/**)"]}}
 ```
 
 - `Write(…)` ではなく `Edit(…)` で書きます。ファイルの規則は Edit と Read で見られ、Write の規則は見られないためです（公式文書の要約）。
-- この規則を足して、確認を出すモード（`manual`）で subagent に書かせたところ、確認は出ませんでした（v2.1.301 で確かめました）。
-- 規則が当たるのは、プランが Claude Code を起動したディレクトリの下にあるときです。
-- 規則は subagent に限らず、メインのセッションの `.pace/` への書き込みにも効きます（公式文書の要約。確かめてはいません）。
+- この規則を足し、確認を出すモード（`manual`）で subagent に書かせたところ、確認は出ませんでした。確かめた条件は、2.1.301、user settings を読まない起動（`--setting-sources project,local`）、subagent はバックグラウンドで動いた、です。規則を足さないときに確認が出るかは確かめていません。
+- 規則が当たるのは、プランが Claude Code を起動したディレクトリの下にあるときだけの見込みです（パスの規則の書き方からの推論。確かめていません）。
+- 規則は subagent に限らず、メインのセッションの `.pace/` への書き込みにも効きます（公式文書の要約。確かめていません）。そのため、メインのセッションが subagent の答え（`*.out.json`）を自分で書いても、確認の画面では気づけません。
 
 ## 判定役のモデル
 
@@ -73,7 +84,7 @@ GitHub から入れた `pace` の marketplace が既にあるときは名前が�
 
 - 組織の `availableModels` で `opus` が禁じられていると、許された版に置き換わるか、親のセッションのモデルで動きます（公式文書の要約）。
 - 契約やプロバイダの都合で `opus` が使えないときの振る舞いは、環境ごとに違い、確かめていません。
-- モデルを差し替えたいときは、settings の `env` に次を書きます（公式文書の要約による。確かめてはいません）。これは全部の subagent に効きます。`pace-worker` と `pace-judge` は同じモデルになり、ほかの plugin の subagent も同じモデルになります。
+- モデルを差し替えたいときは、settings の `env` に次を書きます。公式文書の要約では、これは全部の subagent に効き、`pace-worker` と `pace-judge` は同じモデルになり、ほかの plugin の subagent も同じモデルになります（確かめていません）。
 
 ```json
 {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet", "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"}}
@@ -83,10 +94,10 @@ GitHub から入れた `pace` の marketplace が既にあるときは名前が�
 
 **プランは plan mode の外で書き、PACE も plan mode の外で起動してください。**
 
-plan mode のセッション（v2.1.301）で確かめたところ、次のようになりました。
+plan mode のセッション（2.1.301）で確かめたところ、次のようになりました。
 
-- `/pace:pace`（pace.py の Bash）は、確認なしで動きました。
+- `/pace:pace`（`pace.py --version` を叩くだけ）は、確認なしで動きました。書き込みを伴う pace.py の段は、まだ無いので試していません。
 - 実行役の subagent にジョブを渡させると、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まりました。
-- plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になるので、上の権限の規則も当たりません。
+- plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になりました。上の権限の規則は当たらない見込みです（推論。確かめていません）。
 
-PACE の1回の起動は、`.pace/` への書き込みと subagent の書き込みを要するので、plan mode の中では回りません。
+PACE の1回の起動は subagent にジョブを渡すことを要するので、plan mode の中では回りません。
