@@ -117,11 +117,15 @@ class InitTest(unittest.TestCase):
 
     def test_broken_source_json(self):
         self.init()
+        before = (self.work / "units.jsonl").read_bytes()
+        (self.work / "report.md").write_text("old")
         for body in ("{", '{"plan_file": 1}', '{"plan_file": "../x.md"}', "[]"):
             (self.work / "source.json").write_text(body)
             r = self.init()
             self.assertEqual(r.returncode, 1, body)
-            self.assertTrue((self.work / "units.jsonl").exists())
+            self.assertEqual((self.work / "units.jsonl").read_bytes(), before)
+            self.assertEqual((self.work / "source.json").read_text(), body)
+            self.assertTrue((self.work / "report.md").exists())
 
     def test_symlink_pace_dir_is_refused(self):
         real = self.dir / "real"
@@ -183,6 +187,54 @@ class InitTest(unittest.TestCase):
         self.assertEqual(neighbor.read_text(), "x")
         self.assertTrue((self.work / "units.jsonl").exists())
         self.assertEqual((self.pace / ".gitignore").read_text(), "*\n")
+
+    def test_source_json_keeps_the_original_name(self):
+        plan = self.dir / "design.markdown"
+        plan.write_text("一。", encoding="utf-8")
+        self.assertEqual(self.init(plan).returncode, 0)
+        self.assertEqual(json.loads((self.pace / "design" / "source.json").read_text()),
+                         {"plan_file": "design.markdown"})
+        self.assertEqual(self.init(plan).returncode, 0)
+
+    def test_dot_name_keeps_its_name(self):
+        plan = self.dir / ".md"
+        plan.write_text("一。", encoding="utf-8")
+        self.assertEqual(self.init(plan).returncode, 0)
+        self.assertTrue((self.pace / ".md" / "units.jsonl").exists())
+
+    def test_fifo_is_unreadable(self):
+        fifo = self.dir / "pipe.md"
+        os.mkfifo(str(fifo))
+        r = subprocess.run([sys.executable, str(PACE), "init", str(fifo)], capture_output=True, text=True,
+                           timeout=10)
+        self.assertEqual((r.returncode, r.stdout), (0, UNREADABLE))
+        self.assertFalse(self.pace.exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "root は読む権限を無視する")
+    def test_plan_without_read_permission_is_failure(self):
+        os.chmod(str(self.plan), 0o200)
+        try:
+            r = self.init()
+        finally:
+            os.chmod(str(self.plan), 0o600)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("プランを読めませんでした", r.stderr)
+        self.assertFalse(self.pace.exists())
+
+    def test_refusal_does_not_write_gitignore(self):
+        self.pace.mkdir()
+        self.work.write_text("x")
+        self.assertEqual(self.init().returncode, 1)
+        self.assertFalse((self.pace / ".gitignore").exists())
+
+    def test_mode_of_existing_file_is_kept(self):
+        # 作り直さずに書き換えるファイル（.gitignore・source.json）は、元の権限を写す
+        self.init()
+        for path in (self.pace / ".gitignore", self.work / "source.json"):
+            os.chmod(str(path), 0o640)
+        self.init()
+        for path in (self.pace / ".gitignore", self.work / "source.json"):
+            self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o640, path)
 
     def test_version_is_unchanged(self):
         r = run("--version")

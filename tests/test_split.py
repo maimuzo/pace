@@ -64,6 +64,8 @@ class JoinTest(unittest.TestCase):
         self.assertEqual([u["text"] for u in split("設定が\n`cfg` にある")], ["設定が `cfg` にある"])
         # 端の ** は外すので、その内側の字で決める
         self.assertEqual([u["text"] for u in split("**重要**\nです。")], ["重要です。"])
+        # 見ないのは ** だけ。単独の * は ASCII の字として数える
+        self.assertEqual([u["text"] for u in split("*強調*\nです。")], ["*強調* です。"])
 
     def test_blank_line_starts_new_paragraph(self):
         self.assertEqual([u["text"] for u in split("一つ目\n\n二つ目")], ["一つ目", "二つ目"])
@@ -85,6 +87,9 @@ class JoinTest(unittest.TestCase):
             ("code_line", "x"),
             ("sentence", "引用"),
         ])
+
+    def test_marker_only_bullet_points_to_marker_line(self):
+        self.assertEqual([(u["kind"], u["text"], u["line"]) for u in split("1.\n  本文")], [("bullet", "本文", 1)])
 
     def test_four_space_indent_is_continuation(self):
         self.assertEqual(kinds_texts("本文\n\n    {\"a\": 1}"), [("sentence", "本文"), ("sentence", "{\"a\": 1}")])
@@ -131,6 +136,11 @@ class TableTest(unittest.TestCase):
     def test_empty_edge_cells(self):
         self.assertEqual(kinds_texts("| | a | |"), [("table_row", "| a |")])
 
+    def test_dash_data_row_is_kept(self):
+        # 区切り行として捨てるのは表の2行目だけ
+        self.assertEqual(kinds_texts("| 列 | 値 |\n| --- | --- |\n| - | - |\n\n| --- |"),
+                         [("table_row", "列 | 値"), ("table_row", "- | -"), ("table_row", "---")])
+
     def test_row_without_trailing_pipe(self):
         self.assertEqual(kinds_texts("| a | b"), [("table_row", "a | b")])
 
@@ -140,7 +150,7 @@ class TableTest(unittest.TestCase):
 
 class HeadingTest(unittest.TestCase):
     def test_closing_hashes(self):
-        self.assertEqual(kinds_texts("## C#\n## 題 ##"), [("heading", "C#"), ("heading", "題")])
+        self.assertEqual(kinds_texts("## C#\n## 題 ##\n## ##"), [("heading", "C#"), ("heading", "題")])
 
     def test_tab_counts_as_one_indent(self):
         self.assertEqual(kinds_texts("\t# 題\n\t| a |\n\t---\n本文"),
@@ -182,6 +192,14 @@ class FenceTest(unittest.TestCase):
 
     def test_inline_triple_backtick_is_not_fence(self):
         self.assertEqual(kinds_texts("```x```。後。"), [("sentence", "```x```。"), ("sentence", "後。")])
+
+
+class SpeedTest(unittest.TestCase):
+    def test_large_paragraph_is_not_quadratic(self):
+        import time
+        start = time.monotonic()
+        split("。\n".join(["文"] * 20000) + "\n" + "`a`**" * 20000)
+        self.assertLess(time.monotonic() - start, 3.0)
 
 
 class SentenceTest(unittest.TestCase):

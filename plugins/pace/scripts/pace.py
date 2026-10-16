@@ -8,11 +8,13 @@ docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ�
 """
 
 import argparse
+import bisect
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -35,7 +37,10 @@ UNREADABLE_STATUS = "PACE-STATUS: errors=1 failed_jobs=0 fixes=0 questions=0"
 
 
 class PaceError(Exception):
-    """プラン以外の失敗。標準エラーに理由を出して 1 で終わる。"""
+    """errors に数えない失敗（読む権限が無い・書けない・作業ディレクトリが使えない）。標準エラーに理由を出して 1 で終わる。
+
+    errors に数えるのは、プランが無いことと UTF-8 でないことだけ（docs/plans/pace_design.md の5節）。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +96,9 @@ def code_spans(text):
 
 
 def in_spans(pos, spans):
-    return any(start <= pos < end for start, end in spans)
+    """spans は始まりの順に並んでいて重ならない。二分探索で引く（巨大な単位でも2乗にしない）。"""
+    k = bisect.bisect_right(spans, (pos, float("inf"))) - 1
+    return k >= 0 and spans[k][0] <= pos < spans[k][1]
 
 
 def normalize(text):
@@ -124,8 +131,13 @@ def join_pieces(pieces):
         # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる。
         # 端の ** はあとで外すので、その内側の字で決める（「**重要**」で折り返しても本文を変えない）
         if raw:
-            last = raw.rstrip("*")[-1:] or raw[-1]
-            first = piece.lstrip("*")[:1] or piece[0]
+            last, first = raw, piece
+            while last.endswith("**"):
+                last = last[:-2]
+            while first.startswith("**"):
+                first = first[2:]
+            last = last[-1:] or raw[-1]
+            first = first[:1] or piece[0]
             if ord(last) < 128 or ord(first) < 128:
                 raw += " "
         starts.append((len(raw), line_no))
@@ -133,13 +145,10 @@ def join_pieces(pieces):
     return raw, starts
 
 
-def line_at(pos, starts):
-    line_no = starts[0][1]
-    for start, no in starts:
-        if start > pos:
-            break
-        line_no = no
-    return line_no
+def line_at(pos, positions, starts):
+    """本文の位置 pos が、つなぐ前のどの行にあったかを返す。positions は starts の始まりの位置の列。"""
+    k = bisect.bisect_right(positions, pos) - 1
+    return starts[max(k, 0)][1]
 
 
 def split_sentences(raw):
@@ -217,6 +226,8 @@ def split_units(text):
     sec = ""
     fence = None  # {"char", "width", "depth"}
     block = None  # {"kind", "depth", "pieces"}
+    table_rows = 0  # いまの表で、ここまでに見た行の数（表の行が途切れたら 0 に戻す）
+    in_table = False
 
     def path():
         return [t for _, t in headings]
@@ -232,14 +243,19 @@ def split_units(text):
         raw, starts = join_pieces(block["pieces"])
         if raw:
             if block["kind"] == "bullet":
-                emit("bullet", starts[0][1], normalize(raw))
+                # line は記号の行（記号だけの行のあとに本文が続いても、記号の行を指す）
+                emit("bullet", block["pieces"][0][0], normalize(raw))
             else:
+                positions = [start for start, _ in starts]
                 for pos, sentence in split_sentences(raw):
                     lead = len(sentence) - len(sentence.lstrip())
-                    emit("sentence", line_at(pos + lead, starts), normalize(sentence))
+                    emit("sentence", line_at(pos + lead, positions, starts), normalize(sentence))
         block = None
 
     for line_no, line in enumerate(lines, start=1):
+        if not in_table:
+            table_rows = 0
+        in_table = False
         if fence is not None:
             _, rest = strip_quote(line, fence["depth"])
             mark = rest.strip()
@@ -266,7 +282,9 @@ def split_units(text):
         if m:
             close_block()
             level = len(m.group(1))
-            title = normalize(HEADING_CLOSE.sub("", m.group(2) or ""))
+            title = m.group(2) or ""
+            title = "" if re.fullmatch(r"#+[ \t]*", title) else HEADING_CLOSE.sub("", title)
+            title = normalize(title)
             if not title:
                 # 本文の無い見出しは、単位にも文書の構造にもしない
                 continue
@@ -291,8 +309,11 @@ def split_units(text):
         if TABLE.match(rest):
             close_block()
             row, separator = table_cells(rest)
-            if not separator:
+            # 区切り行として捨てるのは、表の2行目だけ（「- 」で該当なしを書いたデータの行は残す）
+            if not (separator and table_rows == 1):
                 emit("table_row", line_no, normalize(row))
+            table_rows += 1
+            in_table = True
             continue
 
         m = BULLET.fullmatch(rest)
@@ -328,6 +349,9 @@ def split_units(text):
 def read_plan(plan):
     """プランを読み、(バイト, 本文) を返す。読めない（無い・UTF-8 でない）ときは None。"""
     try:
+        if not stat.S_ISREG(plan.stat().st_mode):
+            # ディレクトリ・FIFO・機器のファイルは「ファイルとして無い」と数える（FIFO を読むと戻らない）
+            return None
         data = plan.read_bytes()
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return None
@@ -435,6 +459,10 @@ def init(plan_arg):
         print("NEXT: show")
         return 0
     data, text = read
+    try:
+        source = (json.dumps({"plan_file": plan.name}, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     pace_dir, work = workdir_for(plan)
     check_dir(pace_dir)
     check_dir(work)
@@ -444,8 +472,7 @@ def init(plan_arg):
         pace_dir.mkdir(exist_ok=True)
         write_atomic(pace_dir / ".gitignore", b"*\n")
         work.mkdir(exist_ok=True)
-        write_atomic(work / "source.json",
-                     (json.dumps({"plan_file": plan.name}, ensure_ascii=False) + "\n").encode("utf-8"))
+        write_atomic(work / "source.json", source)
         clear_workdir(work)
         write_atomic(work / "plan.md", data)
         lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
