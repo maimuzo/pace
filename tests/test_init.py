@@ -269,6 +269,7 @@ class InitTest(unittest.TestCase):
         self.assertIn("作業ディレクトリの名前を作れない", r.stderr)
         self.assertFalse(self.pace.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root は権限を無視する")
     def test_unenterable_pace_dir_is_failure_without_traceback(self):
         self.pace.mkdir()
         os.chmod(str(self.pace), 0o000)

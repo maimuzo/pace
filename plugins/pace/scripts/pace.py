@@ -37,7 +37,8 @@ KEEP = frozenset({"cache", "rounds.jsonl", "shown.md", "show_snapshot.md", "sour
 UNREADABLE_STATUS = "PACE-STATUS: errors=1 failed_jobs=0 fixes=0 questions=0"
 
 # .pace/ の中は、init を打った利用者だけが読み書きする（プランの中身を他の利用者に読ませない）。
-# umask はこれをさらに狭めるだけで、広げはしない
+# ファイルは umask に依らず 0600 に揃える。ディレクトリは mkdir が umask を当てるので、持ち主のビットを
+# 消す umask（0o100・0o200・0o400 など）では中に書けず、init は 1 で終わる
 PRIVATE_FILE = 0o600
 PRIVATE_DIR = 0o700
 
@@ -458,16 +459,10 @@ def check_owner(plan, work):
         % (work, recorded, plan.name, plan.name, work, recorded))
 
 
-def current_umask():
-    mask = os.umask(0)
-    os.umask(mask)
-    return mask
-
-
-def write_atomic(path, data, new_mode=None):
+def write_atomic(path, data, new_mode):
     """同じディレクトリの一時ファイルへ書き切ってから差し替える。
 
-    既にあるファイルの権限は写す。新しく作るときは new_mode（無ければ umask の既定）にする。
+    既にあるファイルの権限は写す。新しく作るときは new_mode にする（umask は当てない）。
     失敗は、一時ファイルでなく書こうとした path を filename に持つ OSError にして投げる。
     """
     try:
@@ -477,7 +472,7 @@ def write_atomic(path, data, new_mode=None):
     except OSError as e:
         raise OSError(e.errno, e.strerror, str(path))
     if mode is None:
-        mode = new_mode if new_mode is not None else 0o666 & ~current_umask()
+        mode = new_mode
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
     except OSError as e:
