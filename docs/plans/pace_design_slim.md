@@ -11,7 +11,8 @@
 
 **言いたいこと。**PACE は、AI が書いた設計プランから根拠のグラフを作る。根拠の無い決定・循環論法・プランに無い前提への依存を洗い出し、書き手（AI）が直すものと、人間が決めるものに分けて返す。continuo を知らない、単独の Claude Code プラグインとして配る。
 
-- 入れ方: `claude plugin marketplace add maimuzo/pace` → `claude plugin install pace@pace`。更新は `claude plugin marketplace update pace` と `claude plugin update pace@pace`。
+- 入れ方: `claude plugin marketplace add maimuzo/pace` → `claude plugin install pace@pace`。更新は `claude plugin marketplace update pace` と `claude plugin update pace@pace`。マージ前に手元から試すときは `claude --plugin-dir <checkout>/plugins/pace`。
+- 権限: `pace.py` は skill の `allowed-tools` で、起動したターンの間は確認なしで叩ける見込み（1回叩けることは確かめた）。subagent の書き込みは、利用者が settings に `Edit(**/.pace/**)` を足して許す（README に書く）。
 - 部品は4つ。
   - `pace.py`: 機械の仕事を受け持つ。AI は呼ばず、プランも書き換えない。
   - `SKILL.md`: 周を回す。
@@ -51,6 +52,9 @@ sequenceDiagram
 ## 防がないこと（限界の要点）
 
 - 書き手が決まりを守ったか、事実の出どころが実在するかは、機械では確かめない。人間に見せる差分と注意で補う。
+- plan mode の中では回らない。プランは plan mode の外で書き、PACE も plan mode の外で起動する（[#2](https://github.com/maimuzo/pace/issues/2) で1回試して判断した。skill から subagent を呼ばせる形ができたら確かめ直す）。
+- 判定役の `opus` が使えるかは、利用者の環境ごとに違い、確かめていない。
+- subagent の書き込みを許す規則（`Edit(**/.pace/**)`）は、プランが Claude Code を起動したディレクトリの下にあるときにしか当たらない見込み。メインのセッションの書き込みにも効くので、書き手が `*.out.json` を自分で書いても確認の画面では気づけない。
 - 別の文書にある根拠は gap として出る。使ってみてから作り込むかを決める（[#9](https://github.com/maimuzo/pace/issues/9)）。
 - 誰が何を言ったか（発言者の扱い）は扱わない。扱う段は、回答の書き写し方とあわせて [#10](https://github.com/maimuzo/pace/issues/10) で決める。
 
