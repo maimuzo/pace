@@ -75,13 +75,14 @@ claude plugin marketplace remove pace --scope local
 **pace.py（Bash）**
 
 `/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。公式文書の要約では、skill を起動したターンの間は確認なしで叩け、次に人間が発言すると、この許可は消えます。
-確認を出すモード（`manual`）で確かめたところ、起動したターンの中では確認なしで進みましたが、subagent はバックグラウンドで動き、その完了の知らせで始まったターンで `pace.py` を叩くときに確認が出ました（2.1.301、user settings を読む起動）。確認を出したくないときは、下の書き込みの規則と一緒に、次の規則を足してください（`scripts/pace.py` を含む `python3` のコマンドを全部許すので、ほかの `pace.py` も確認なしになります）。
+確認を出すモード（`manual`）で確かめたところ、起動したターンの中では確認なしで進みましたが、subagent はバックグラウンドで動き、その完了の知らせで始まったターンで `pace.py` を叩くときに確認が出ました（2.1.301、user settings を読む起動）。確認を出したくないときは、下の書き込みの規則と一緒に、pace.py の絶対パスを書いた規則を足してください。パスは、`/pace:pace` を打ったときの確認の画面か、Bash のコマンドの表示に出ます（入れた plugin なら `~/.claude/plugins/cache/pace/pace/<commit の sha>/scripts/pace.py` の形で、plugin を更新すると変わるので、そのたびに直してください）。
 
 ```json
-{"permissions": {"allow": ["Bash(python3 *scripts/pace.py*)", "Edit(**/.pace/**)"]}}
+{"permissions": {"allow": ["Bash(python3 \"/Users/you/.claude/plugins/cache/pace/pace/0123abcd/scripts/pace.py\" *)", "Edit(**/.pace/**)"]}}
 ```
 
-この2つを足すと、continuo の2本のプラン（89単位と932単位）を確認なしで最後まで回せました。
+- `Bash(python3 *scripts/pace.py*)` のように途中を `*` にすると、`scripts/pace.py` という文字列を含むどんな `python3` のコマンドも確認なしで通るので、勧めません。
+- 規則を足すと、確認なしで最後まで回せました（2.1.301。途中を `*` にした規則で continuo の2本のプラン（89単位と932単位）、絶対パスの規則で89単位のプランの写しを確かめました）。
 
 **subagent の書き込み（Write）**
 

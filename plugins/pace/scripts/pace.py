@@ -613,12 +613,35 @@ def read_regular(path):
         return f.read()
 
 
-def load_work_json(path):
-    """作業ディレクトリの中の、pace.py が書いた JSON を読む。壊れていたら PaceError（init を打ち直す案内）。"""
+def load_work_json(path, valid=lambda obj: True):
+    """作業ディレクトリの中の、pace.py が書いた JSON を読む。
+
+    読めないか、valid が偽を返す形なら PaceError（init を打ち直す案内）。init で消えるファイルにだけ使う
+    （init が残す cache/ は、壊れていたら答えが無いものとして作り直す。cache_get）。
+    """
     try:
-        return json.loads(read_regular(path).decode("utf-8"))
+        obj = json.loads(read_regular(path).decode("utf-8"))
+        ok = valid(obj)
     except (OSError, ValueError, RecursionError) as e:
         raise PaceError("%s を読めません（%s）。init を打ち直してください" % (path, e))
+    if not ok:
+        raise PaceError("%s の形が違います。init を打ち直してください" % path)
+    return obj
+
+
+def is_str_list(obj):
+    return isinstance(obj, list) and all(isinstance(x, str) for x in obj)
+
+
+def valid_job(obj):
+    return (isinstance(obj, dict) and obj.get("stage") in JOB_STAGES and isinstance(obj.get("job_id"), str)
+            and isinstance(obj.get("attempts"), int) and is_str_list(obj.get("previous_errors"))
+            and isinstance(obj.get("out_path"), str) and isinstance(obj.get("input"), dict)
+            and obj.get("status") in ("pending", "issued", "done", "failed"))
+
+
+# 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
+ERROR_MAX_CHARS = 300
 
 
 def write_json(path, obj):
@@ -719,6 +742,10 @@ class Round:
             self.units = [json.loads(line) for line in lines if line]
         except (OSError, ValueError, RecursionError) as e:
             raise PaceError("%s を読めません（%s）。init を打ち直してください" % (self.work / "units.jsonl", e))
+        if not all(isinstance(u, dict) and isinstance(u.get("id"), str) and isinstance(u.get("text"), str)
+                   and isinstance(u.get("kind"), str) and isinstance(u.get("sec"), str)
+                   and is_str_list(u.get("path")) and isinstance(u.get("line"), int) for u in self.units):
+            raise PaceError("%s の形が違います。init を打ち直してください" % (self.work / "units.jsonl"))
         # 前後の文は文書の中の位置で引く（節をまたいでよい。docs/idea.md 段2 の neighbors）
         self.pos = {u["id"]: i for i, u in enumerate(self.units)}
         source = self.work / "source.json"
@@ -753,10 +780,18 @@ class Round:
                                              "text": unit["text"], "A": a, "B": b})
 
     def cache_get(self, key):
+        """キャッシュの答え。無いか、読めないか、形が違えば None（その単位はジョブを作り直し、cache_put が上書きする）。
+
+        cache/ は init が残すので、壊れたものに「init を打ち直して」と案内しても直らない。
+        """
         path = self.cache_dir / (key + ".json")
         if not os.path.lexists(str(path)):
             return None
-        return load_work_json(path)["labels"]
+        try:
+            obj = json.loads(read_regular(path).decode("utf-8"))
+            return check_labels(obj["labels"], key)
+        except (OSError, ValueError, RecursionError, TypeError, KeyError):
+            return None
 
     def cache_put(self, key, labels):
         make_private_dir(self.cache_dir)
@@ -768,10 +803,10 @@ class Round:
         """周の印。init のあと最初の next が決め、ジョブの名前に入れる（前の起動の遅れた答えを見ないため）。"""
         path = self.jobs_dir / "round.json"
         if os.path.lexists(str(path)):
-            return load_work_json(path)["round"]
-        # 印が無いのに段のディレクトリがあれば、どの周のものか分からないので消す
+            return load_work_json(path, lambda o: isinstance(o, dict) and isinstance(o.get("round"), str))["round"]
+        # 印が無いのに jobs/ があれば、どの周のものか分からないので消す（symlink でないことは __init__ で確かめた）
         if self.jobs_dir.exists():
-            clear_workdir(self.jobs_dir)
+            shutil.rmtree(str(self.jobs_dir))
         make_private_dir(self.jobs_dir)
         rid = os.urandom(4).hex()
         write_json(path, {"round": rid})
@@ -789,7 +824,7 @@ class Round:
             raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, d))
         mark = d / "created.json"
         if os.path.lexists(str(mark)):
-            info = load_work_json(mark)
+            info = load_work_json(mark, lambda o: isinstance(o, dict) and is_str_list(o.get("jobs")))
             if info.get("round") == rid:
                 return info["jobs"]
         if d.exists():
@@ -800,7 +835,7 @@ class Round:
         return self.stage_dir(stage) / (job_id + ".json")
 
     def load_job(self, stage, job_id):
-        return load_work_json(self.job_path(stage, job_id))
+        return load_work_json(self.job_path(stage, job_id), valid_job)
 
     def new_job(self, stage, job_id, job_input, cache_key="", variant=None):
         d = self.stage_dir(stage)
@@ -876,9 +911,12 @@ class Round:
         if not os.path.lexists(str(path)):
             return []
         try:
-            return [json.loads(line) for line in read_regular(path).decode("utf-8").splitlines() if line]
+            recs = [json.loads(line) for line in read_regular(path).decode("utf-8").splitlines() if line]
         except (OSError, ValueError, RecursionError) as e:
             raise PaceError("%s を読めません（%s）。init を打ち直してください" % (path, e))
+        if not all(isinstance(r, dict) and is_str_list(r.get("units")) for r in recs):
+            raise PaceError("%s の形が違います。init を打ち直してください" % path)
+        return recs
 
     def classified(self, unit):
         return self.cache_get(self.classify_key("A", unit)), self.cache_get(self.classify_key("B", unit))
@@ -935,6 +973,8 @@ class Round:
             # 古い答えの名前を変えてから attempts を増やす（同じ名前で残すと、次の next が同じ答えを検証し直す）
             os.replace(str(out), str(out.parent / ("%s.rejected-%d.json" % (job["job_id"], n))))
         job["attempts"] = n
+        if len(error) > ERROR_MAX_CHARS:
+            error = error[:ERROR_MAX_CHARS] + "…"
         job["previous_errors"].append(error)
         if n > MAX_RETRIES:
             # 記録を先に書いてから failed にする。記録は job_id で重ねない
@@ -953,7 +993,8 @@ class Round:
 
     # --- 波 ---------------------------------------------------------------
 
-    def bundles(self, stage, jobs):
+    @staticmethod
+    def bundles(jobs):
         """pending のジョブを束にする。A と B は別の束にし、交互に並べる。"""
         groups = {}
         for job in jobs:
@@ -980,7 +1021,7 @@ class Round:
         return mixed
 
     def emit(self, stage, pending):
-        chosen = self.bundles(stage, pending)[:PARALLEL]
+        chosen = self.bundles(pending)[:PARALLEL]
         wave = []
         for k, bundle in enumerate(chosen, start=1):
             for job in bundle:
@@ -1028,6 +1069,11 @@ class Round:
         return result
 
     def run(self):
+        # nodes.jsonl は DONE のときだけ書き直す。前の DONE のものを残すと、網羅が欠けて 1 で終わったあとも
+        # 古いノードを後の段が読むので、ほかの何より先に消す
+        nodes_path = self.work / "nodes.jsonl"
+        if os.path.lexists(str(nodes_path)):
+            os.unlink(str(nodes_path))
         rid = self.round_id()
         # (1) issued のジョブだけを判定する
         for stage in JOB_STAGES:

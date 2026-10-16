@@ -12,7 +12,7 @@
 **言いたいこと。**PACE は、AI が書いた設計プランから根拠のグラフを作る。根拠の無い決定・循環論法・プランに無い前提への依存を洗い出し、書き手（AI）が直すものと、人間が決めるものに分けて返す。continuo を知らない、単独の Claude Code プラグインとして配る。
 
 - 入れ方: `claude plugin marketplace add maimuzo/pace` → `claude plugin install pace@pace`。更新は `claude plugin marketplace update pace` と `claude plugin update pace@pace`。マージ前に手元から試すときは `claude --plugin-dir <checkout>/plugins/pace`。
-- 権限: `pace.py` は skill の `allowed-tools` で、起動したターンの間だけ確認なしで叩ける。subagent はバックグラウンドで動き、その完了の知らせで始まるターンには許可が続かないので、確認を出すモードでは利用者が settings に `Bash(python3 *scripts/pace.py*)` と `Edit(**/.pace/**)` を足す（README に書く。足すと continuo の2本を確認なしで最後まで回せた）。
+- 権限: `pace.py` は skill の `allowed-tools` で、起動したターンの間だけ確認なしで叩ける。subagent はバックグラウンドで動き、その完了の知らせで始まるターンには許可が続かないので、確認を出すモードでは利用者が settings に `Bash(python3 "<pace.py の絶対パス>" *)` と `Edit(**/.pace/**)` を足す（README に書く。足すと continuo の2本を確認なしで最後まで回せた）。
 - 部品は4つ。
   - `pace.py`: 機械の仕事を受け持つ。AI は呼ばず、プランも書き換えない。
   - `SKILL.md`: 周を回す。

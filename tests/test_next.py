@@ -1,7 +1,7 @@
 """pace.py next の unittest。決まりは docs/plans/pace_design.md の14節（ジョブと束）と9節（作業ディレクトリ）。
 
 テストが実行役（subagent）の代わりに *.out.json を書き、next を subprocess で叩く。
-鍵の計算だけは test_split.py と同じく import して確かめる（指示文と agent の定義を差し替えるため）。
+束の分け方・鍵の計算・定数は、test_split.py と同じく import して確かめる（指示文と agent の定義を差し替えるため）。
 """
 
 import json
@@ -132,7 +132,7 @@ class NextTest(unittest.TestCase):
     def test_bundle_limits(self):
         jobs = [{"variant": "A", "job_id": "j%d" % i, "pad": "x" * 25000} for i in range(5)]
         jobs += [{"variant": "B", "job_id": "k%d" % i} for i in range(45)]
-        out = pace.Round.bundles(None, "classify", jobs)
+        out = pace.Round.bundles(jobs)
         for b in out:
             self.assertLessEqual(len(b), pace.BUNDLE_MAX_JOBS)
             self.assertEqual(len({j["variant"] for j in b}), 1)
@@ -429,6 +429,13 @@ class NextTest(unittest.TestCase):
         r = self.next(ok=False)
         self.assertEqual(r.returncode, 1)
         self.assertIn("init を打ち直して", r.stderr)
+        self.assertFalse((self.work / "nodes.jsonl").exists())
+        # init を打ち直せば、欠けた分だけジョブを作り直して DONE まで行く
+        self.init()
+        bundles, last = parse(self.next().stdout)
+        self.assertEqual(sum(len(ps) for _, _, ps in bundles), 1)
+        answer_all(bundles)
+        self.assertTrue(self.drive().startswith("DONE"))
 
     # --- 止まる場面 ---------------------------------------------------------
 
@@ -458,8 +465,107 @@ class NextTest(unittest.TestCase):
                 self.assertTrue(r.stderr.startswith("pace.py next: "), r.stderr)
                 self.assertNotIn("Traceback", r.stderr)
                 self.assertFalse((self.work / "jobs").exists() and any((self.work / "jobs").iterdir()), case)
+                self.assertFalse((self.work / "pending.json").exists(), case)
+                if case != "cache_symlink":
+                    self.assertFalse((self.work / "cache").exists(), case)
                 if case == "cache_symlink":
                     self.assertEqual(list((self.dir / "outside").iterdir()), [])
+
+    def test_wrong_shape_work_files_stop_without_traceback(self):
+        cases = {
+            "created": ("jobs/classify/created.json", "[]"),
+            "round": ("jobs/round.json", "{}"),
+            "job": (None, "[]"),
+            "failed": ("failed_jobs.jsonl", "[]\n"),
+            "units": ("units.jsonl", "{}\n"),
+        }
+        for case, (rel, text) in cases.items():
+            with self.subTest(case=case):
+                self.setUp()
+                self.init()
+                bundles, _ = parse(self.next().stdout)
+                if case == "failed":
+                    answer_all(bundles)  # 失敗の記録を読むのは、分類が終わって裁定を作るとき
+                path = Path(bundles[0][2][0]) if rel is None else self.work / rel
+                path.write_text(text, encoding="utf-8")
+                r = self.next(ok=False)
+                self.assertEqual(r.returncode, 1, case)
+                self.assertNotIn("Traceback", r.stderr, case)
+                self.assertIn("init を打ち直して", r.stderr, case)
+
+    def test_broken_cache_is_rebuilt(self):
+        for text in ("{", "[]", '{"labels": [{"kind": "zzz"}]}'):
+            with self.subTest(text=text):
+                self.setUp()
+                self.init()
+                self.drive()
+                victim = sorted((self.work / "cache").glob("*.json"))[0]
+                victim.write_text(text, encoding="utf-8")
+                self.init()
+                r = self.next()
+                self.assertNotIn("Traceback", r.stderr)
+                bundles, last = parse(r.stdout)
+                self.assertTrue(last.startswith("WAVE"), last)
+                answer_all(bundles)
+                self.assertTrue(self.drive().startswith("DONE"))
+                self.assertIn("labels", json.loads(victim.read_text(encoding="utf-8")))
+
+    def test_judge_cache_is_used_after_init(self):
+        self.init()
+        target = self.units()[2]["id"]
+
+        def labels(stage, variant, uid):
+            if stage == "adjudicate":
+                return [premise("裁定の答え", "value")]
+            return [decision(), decision()] if (uid == target and variant == "B") else [decision()]
+
+        first = self.drive(labels)
+        nodes1 = (self.work / "nodes.jsonl").read_text(encoding="utf-8")
+        self.init()
+        self.assertEqual(self.next().stdout.strip(), first)
+        self.assertEqual((self.work / "nodes.jsonl").read_text(encoding="utf-8"), nodes1)
+
+    def test_cache_drops_unknown_keys_and_files_are_private(self):
+        self.init()
+
+        def labels(stage, variant, uid):
+            return [dict(decision(), extra="捨てる")]
+
+        self.drive(labels)
+        for p in (self.work / "cache").glob("*.json"):
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(set(obj), {"labels"})
+            self.assertTrue(all(set(x) == {"kind", "text", "alternatives"} for x in obj["labels"]))
+            self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
+        for name in ("pending.json", "nodes.jsonl"):
+            self.assertEqual(stat.S_IMODE((self.work / name).stat().st_mode), 0o600, name)
+        self.assertEqual(stat.S_IMODE((self.work / "cache").stat().st_mode), 0o700)
+
+    def test_long_errors_are_cut(self):
+        bundles, job = self.first_job()
+        self.write_answer(job, json.dumps({"units": [{"uid": "u%08d" % i, "labels": []} for i in range(200)]}))
+        self.next()
+        errs = self.reload(job)["previous_errors"]
+        self.assertTrue(errs and all(len(e) <= pace.ERROR_MAX_CHARS + 1 for e in errs))
+
+    def test_agent_definition_file_changes_key(self):
+        self.init()
+        saved = pace.AGENTS_DIR
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("pace-worker", "pace-judge"):
+                (Path(d) / (name + ".md")).write_bytes((saved / (name + ".md")).read_bytes())
+            try:
+                pace.AGENTS_DIR = Path(d)
+                unit = pace.Round(str(self.plan)).units[0]
+                base = pace.Round(str(self.plan)).classify_key("A", unit)
+                with open(str(Path(d) / "pace-worker.md"), "a", encoding="utf-8") as f:
+                    f.write("\n足した。\n")
+                self.assertNotEqual(base, pace.Round(str(self.plan)).classify_key("A", unit))
+                judge = pace.Round(str(self.plan))
+                self.assertEqual(judge.agent_digest("adjudicate"),
+                                 pace.hashlib.sha256((saved / "pace-judge.md").read_bytes()).hexdigest())
+            finally:
+                pace.AGENTS_DIR = saved
 
     def test_broken_work_file_stops_without_traceback(self):
         self.init()
