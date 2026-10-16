@@ -19,6 +19,9 @@ def run(*args):
 
 class InitTest(unittest.TestCase):
     def setUp(self):
+        # 権限のテストが環境の umask に左右されないよう、022 に揃える（subprocess に引き継がれる）
+        self._umask = os.umask(0o022)
+        self.addCleanup(os.umask, self._umask)
         self._tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self._tmp.name)
         self.plan = self.dir / "plan.md"
@@ -172,7 +175,9 @@ class InitTest(unittest.TestCase):
             os.chmod(str(self.pace), 0o700)
         self.assertEqual(r.returncode, 1)
         self.assertIn("書けませんでした", r.stderr)
+        # 作られていない一時ファイルでなく、書こうとしたファイルを指す
         self.assertNotIn(".tmp", r.stderr)
+        self.assertIn(".gitignore", r.stderr)
 
     def test_multi_dot_name(self):
         plan = self.dir / "a.b.md"
@@ -233,10 +238,20 @@ class InitTest(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
 
     def test_plan_copies_keep_plan_mode(self):
+        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限より広げない
         os.chmod(str(self.plan), 0o600)
         self.init()
-        for name in ("plan.md", "shown.md"):
+        for name in ("plan.md", "shown.md", "units.jsonl"):
             self.assertEqual(os.stat(str(self.work / name)).st_mode & 0o777, 0o600, name)
+        for path in (self.pace, self.work):
+            self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o700, path)
+
+    def test_old_shown_md_is_narrowed(self):
+        self.init()
+        self.assertEqual(os.stat(str(self.work / "shown.md")).st_mode & 0o777, 0o644)
+        os.chmod(str(self.plan), 0o600)
+        self.init()
+        self.assertEqual(os.stat(str(self.work / "shown.md")).st_mode & 0o777, 0o600)
 
     @unittest.skipIf(os.geteuid() == 0, "root は権限を無視する")
     def test_unenterable_pace_dir_is_failure_without_traceback(self):

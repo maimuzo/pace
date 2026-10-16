@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 
 # plugins/pace/scripts は package ではないので、sys.path に足して import する
+# pace を import しても、プラグインのディレクトリに __pycache__ を書かない（プラグインに余計なものを入れない）
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "pace" / "scripts"))
 
 import pace  # noqa: E402
@@ -214,10 +216,14 @@ class SpeedTest(unittest.TestCase):
         split("`a`**" * 40000)
         split("a" + "*" * 1600000 + "\nb")
         split("# a" + " " * 80000 + "b")
-        split("".join("`" * k + " " for k in range(400, 1, -1)) + "`a` " * 100000)
+        split("".join("`" * k + " " for k in range(1200, 1, -1)) + "`a` " * 100000)
+        split("a**\n" * 400000)
+        split(">" * 800000 + " x")
         # 2乗の版では、4万行の段落で10秒、`a`** の4万回で38秒、* の160万個で8秒、
-        # 8万の空白の見出しで15秒かかった（Python 3.9.6）。線形の版は5つ合わせて1秒に届かない
-        self.assertLess(time.monotonic() - start, 5.0)
+        # 8万の空白の見出しで15秒、閉じない backtick の幅1,200種で約17秒、
+        # ** で終わる40万行で8秒、> の80万段で4秒かかった（Python 3.9.6）。
+        # どの1つを2乗に戻しても閾値を超え、線形の版は7つ合わせて2秒に届かない
+        self.assertLess(time.monotonic() - start, 4.0)
 
 
 class SentenceTest(unittest.TestCase):

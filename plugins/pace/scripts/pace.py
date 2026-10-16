@@ -65,14 +65,15 @@ CLOSE_BRACKETS = {v: k for k, v in OPEN_BRACKETS.items()}
 def strip_quote(line, limit=None):
     """行頭の引用の記号を段ごとに外し、(段数, 残り) を返す。limit があれば、その段数までしか外さない。"""
     depth = 0
-    rest = line
+    pos = 0
+    # 段ごとに行の残りを写すと、深く重ねた行で2乗になるので、位置だけを進めて最後に1回切る
     while limit is None or depth < limit:
-        m = QUOTE_MARK.match(rest)
+        m = QUOTE_MARK.match(line, pos)
         if not m:
             break
-        rest = rest[m.end():]
+        pos = m.end()
         depth += 1
-    return depth, rest
+    return depth, line[pos:]
 
 
 def strip_closing_hashes(title):
@@ -142,24 +143,29 @@ def normalize(text):
 
 def join_pieces(pieces):
     """(行番号, 本文) の列を1つの本文につなぎ、(本文, [(始まりの位置, 行番号)]) を返す。"""
-    raw = ""
+    parts = []
+    length = 0
+    last = ""  # つないだ本文の、端の ** を見ない最後の字
     starts = []
     for line_no, piece in pieces:
         piece = piece.strip()
         if not piece:
             continue
         # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる。
-        # 端の ** はあとで外すので、その内側の字で決める（「**重要**」で折り返しても本文を変えない）
-        if raw:
-            stars = len(raw) - len(raw.rstrip("*"))
-            last = raw[:len(raw) - stars + stars % 2][-1:] or raw[-1]
-            stars = len(piece) - len(piece.lstrip("*"))
-            first = piece[stars - stars % 2:][:1] or piece[0]
-            if ord(last) < 128 or ord(first) < 128:
-                raw += " "
-        starts.append((len(raw), line_no))
-        raw += piece
-    return raw, starts
+        # 端の ** はあとで外すので、その内側の字で決める（「**重要**」で折り返しても本文を変えない）。
+        # 本文を写さずに piece の端だけを見るので、行が多くても2乗にならない
+        lead = len(piece) - len(piece.lstrip("*"))
+        first = piece[lead - lead % 2] if lead - lead % 2 < len(piece) else piece[0]
+        if parts and (ord(last) < 128 or ord(first) < 128):
+            parts.append(" ")
+            length += 1
+        starts.append((length, line_no))
+        parts.append(piece)
+        length += len(piece)
+        trail = len(piece) - len(piece.rstrip("*"))
+        cut = len(piece) - trail + trail % 2
+        last = piece[cut - 1] if cut > 0 else (last or piece[-1])
+    return "".join(parts), starts
 
 
 def line_at(pos, positions, starts):
@@ -445,18 +451,27 @@ def current_umask():
     return mask
 
 
-def write_atomic(path, data, new_mode=None):
+def write_atomic(path, data, new_mode=None, limit_mode=None):
     """同じディレクトリの一時ファイルへ書き切ってから差し替える。
 
     既にあるファイルの権限は写す。新しく作るときは new_mode（無ければ umask の既定）にする。
+    limit_mode があれば、どちらの場合もその権限より広げない（プランの中身を持つファイルに使う）。
+    失敗は、一時ファイルでなく書こうとした path を filename に持つ OSError にして投げる。
     """
     try:
         mode = path.stat().st_mode & 0o7777 if not path.is_symlink() else None
     except FileNotFoundError:
         mode = None
+    except OSError as e:
+        raise OSError(e.errno, e.strerror, str(path))
     if mode is None:
         mode = new_mode if new_mode is not None else 0o666 & ~current_umask()
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
+    if limit_mode is not None:
+        mode &= limit_mode | ~0o777
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
+    except OSError as e:
+        raise OSError(e.errno, e.strerror, str(path))
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
@@ -464,11 +479,13 @@ def write_atomic(path, data, new_mode=None):
             os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, str(path))
-    except BaseException:
+    except BaseException as e:
         try:
             os.unlink(tmp)
         except FileNotFoundError:
             pass
+        if isinstance(e, OSError):
+            raise OSError(e.errno, e.strerror, str(path))
         raise
 
 
@@ -498,8 +515,10 @@ def init(plan_arg):
         check_dir(pace_dir)
         check_dir(work)
         check_owner(plan, work)
-        # プランの写しは、元のプランの権限で作る（0600 のプランを他の利用者に読ませない）
-        plan_mode = plan.stat().st_mode & 0o777
+        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限より広げない。
+        # 0600 のプランを他の利用者に読ませないため。group は写さない（作るファイルの group は OS が決める）
+        plan_mode = plan.stat().st_mode & 0o777 & ~current_umask()
+        dir_mode = 0o700 | (0o050 if plan_mode & 0o040 else 0) | (0o005 if plan_mode & 0o004 else 0)
     except OSError as e:
         raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     try:
@@ -508,22 +527,22 @@ def init(plan_arg):
         raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     units = split_units(text)
     try:
-        pace_dir.mkdir(exist_ok=True)
+        pace_dir.mkdir(mode=dir_mode, exist_ok=True)
         write_atomic(pace_dir / ".gitignore", b"*\n")
-        work.mkdir(exist_ok=True)
+        work.mkdir(mode=dir_mode, exist_ok=True)
         write_atomic(work / "source.json", source)
         clear_workdir(work)
-        write_atomic(work / "plan.md", data, plan_mode)
+        write_atomic(work / "plan.md", data, plan_mode, plan_mode)
         lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
-        write_atomic(work / "units.jsonl", lines.encode("utf-8"))
-        if not (work / "shown.md").exists():
-            write_atomic(work / "shown.md", data, plan_mode)
+        write_atomic(work / "units.jsonl", lines.encode("utf-8"), plan_mode, plan_mode)
+        shown = work / "shown.md"
+        if not shown.exists():
+            write_atomic(shown, data, plan_mode, plan_mode)
+        else:
+            # 前に広い権限で作った shown.md も、いまのプランの権限より広げない
+            os.chmod(str(shown), os.stat(str(shown)).st_mode & (plan_mode | ~0o777) & 0o7777)
     except OSError as e:
-        failed = Path(e.filename) if e.filename else work
-        if failed.name.startswith(".") and failed.name.endswith(".tmp"):
-            # 一時ファイルは作られていないことがあるので、それを置くディレクトリを指す
-            failed = failed.parent
-        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, failed))
+        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     print("units=%d" % len(units))
     return 0
 
