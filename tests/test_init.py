@@ -246,6 +246,55 @@ class InitTest(unittest.TestCase):
         for path in (self.pace, self.work):
             self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o700, path)
 
+    def test_mode_follows_umask_and_group(self):
+        os.umask(0o077)
+        self.init()
+        self.assertEqual(os.stat(str(self.work / "units.jsonl")).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(str(self.pace)).st_mode & 0o777, 0o700)
+
+    def test_group_shared_plan_keeps_group_access(self):
+        os.umask(0o002)
+        os.chmod(str(self.plan), 0o664)
+        self.init()
+        self.assertEqual(os.stat(str(self.work / "units.jsonl")).st_mode & 0o777, 0o664)
+        for path in (self.pace, self.work):
+            self.assertEqual(os.stat(str(path)).st_mode & 0o777, 0o775, path)
+
+    def test_plan_without_owner_bits_still_gives_owner_access(self):
+        # 他人の持ち物で group だけが読める 0044 のプランを回すと、写しの持ち主は init を打った利用者になる。
+        # 同じ利用者では作れない場面なので、権限を決める関数を直に確かめる
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, str(PACE.parent))
+        try:
+            import pace
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(pace.modes_for(0o044), (0o644, 0o755))
+        self.assertEqual(pace.modes_for(0o600), (0o600, 0o700))
+        self.assertEqual(pace.modes_for(0o664), (0o664, 0o775))
+
+    def test_kept_symlink_is_not_followed(self):
+        self.init()
+        outside = self.dir / "outside.txt"
+        outside.write_text("x")
+        os.chmod(str(outside), 0o644)
+        shown = self.work / "shown.md"
+        shown.unlink()
+        os.symlink(str(outside), str(shown))
+        os.chmod(str(self.plan), 0o600)
+        self.assertEqual(self.init().returncode, 0)
+        self.assertEqual(os.stat(str(outside)).st_mode & 0o777, 0o644)
+        self.assertTrue(shown.is_symlink())
+
+    def test_old_show_snapshot_is_narrowed(self):
+        self.init()
+        snap = self.work / "show_snapshot.md"
+        snap.write_text("写し")
+        os.chmod(str(snap), 0o644)
+        os.chmod(str(self.plan), 0o600)
+        self.init()
+        self.assertEqual(os.stat(str(snap)).st_mode & 0o777, 0o600)
+
     def test_old_shown_md_is_narrowed(self):
         self.init()
         self.assertEqual(os.stat(str(self.work / "shown.md")).st_mode & 0o777, 0o644)

@@ -1,0 +1,2 @@
+# テストを流すと tests/ に作られる（Python の版によっては plugins/ の下にも）
+__pycache__/

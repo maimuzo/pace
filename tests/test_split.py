@@ -209,21 +209,25 @@ class FenceTest(unittest.TestCase):
 
 
 class SpeedTest(unittest.TestCase):
-    def test_large_paragraph_is_not_quadratic(self):
+    def test_large_inputs_are_not_quadratic(self):
         import time
-        start = time.monotonic()
-        split("。\n".join(["文"] * 40000))
-        split("`a`**" * 40000)
-        split("a" + "*" * 1600000 + "\nb")
-        split("# a" + " " * 80000 + "b")
-        split("".join("`" * k + " " for k in range(1200, 1, -1)) + "`a` " * 100000)
-        split("a**\n" * 400000)
-        split(">" * 800000 + " x")
-        # 2乗の版では、4万行の段落で10秒、`a`** の4万回で38秒、* の160万個で8秒、
-        # 8万の空白の見出しで15秒、閉じない backtick の幅1,200種で約17秒、
-        # ** で終わる40万行で8秒、> の80万段で4秒かかった（Python 3.9.6）。
-        # どの1つを2乗に戻しても閾値を超え、線形の版は7つ合わせて2秒に届かない
-        self.assertLess(time.monotonic() - start, 4.0)
+        # 入力ごとに時間を測り、1つずつ2秒と比べる。2乗の版では、この機（Python 3.9.6）で
+        # 4万行の段落 10秒・`a`** の4万回 38秒・* の160万個 8秒・8万の空白の見出し 15秒・
+        # 閉じない backtick の幅1,200種 18秒・** で終わる40万行 8秒・> の160万段 約17秒かかった。
+        # 線形の版はどれも0.7秒に届かないので、速さが数倍違う機でも見分けられる
+        inputs = [
+            ("段落", "。\n".join(["文"] * 40000)),
+            ("backtick と **", "`a`**" * 40000),
+            ("行末の *", "a" + "*" * 1600000 + "\nb"),
+            ("見出しの空白", "# a" + " " * 80000 + "b"),
+            ("閉じない backtick", "".join("`" * k + " " for k in range(1200, 1, -1)) + "`a` " * 100000),
+            ("** で終わる行", "a**\n" * 400000),
+            ("深い引用", ">" * 1600000 + " x"),
+        ]
+        for name, text in inputs:
+            start = time.monotonic()
+            split(text)
+            self.assertLess(time.monotonic() - start, 2.0, name)
 
 
 class SentenceTest(unittest.TestCase):

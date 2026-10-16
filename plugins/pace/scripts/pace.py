@@ -156,7 +156,8 @@ def join_pieces(pieces):
         # 本文を写さずに piece の端だけを見るので、行が多くても2乗にならない
         lead = len(piece) - len(piece.lstrip("*"))
         first = piece[lead - lead % 2] if lead - lead % 2 < len(piece) else piece[0]
-        if parts and (ord(last) < 128 or ord(first) < 128):
+        spaced = bool(parts) and (ord(last) < 128 or ord(first) < 128)
+        if spaced:
             parts.append(" ")
             length += 1
         starts.append((length, line_no))
@@ -164,7 +165,13 @@ def join_pieces(pieces):
         length += len(piece)
         trail = len(piece) - len(piece.rstrip("*"))
         cut = len(piece) - trail + trail % 2
-        last = piece[cut - 1] if cut > 0 else (last or piece[-1])
+        if cut > 0:
+            last = piece[cut - 1]
+        elif spaced:
+            # ** だけの行。端の ** を見ないと、最後の字はその前に入れた空白になる
+            last = " "
+        else:
+            last = last or piece[-1]
     return "".join(parts), starts
 
 
@@ -451,11 +458,10 @@ def current_umask():
     return mask
 
 
-def write_atomic(path, data, new_mode=None, limit_mode=None):
+def write_atomic(path, data, new_mode=None):
     """同じディレクトリの一時ファイルへ書き切ってから差し替える。
 
     既にあるファイルの権限は写す。新しく作るときは new_mode（無ければ umask の既定）にする。
-    limit_mode があれば、どちらの場合もその権限より広げない（プランの中身を持つファイルに使う）。
     失敗は、一時ファイルでなく書こうとした path を filename に持つ OSError にして投げる。
     """
     try:
@@ -466,8 +472,6 @@ def write_atomic(path, data, new_mode=None, limit_mode=None):
         raise OSError(e.errno, e.strerror, str(path))
     if mode is None:
         mode = new_mode if new_mode is not None else 0o666 & ~current_umask()
-    if limit_mode is not None:
-        mode &= limit_mode | ~0o777
     try:
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
     except OSError as e:
@@ -487,6 +491,38 @@ def write_atomic(path, data, new_mode=None, limit_mode=None):
         if isinstance(e, OSError):
             raise OSError(e.errno, e.strerror, str(path))
         raise
+
+
+def modes_for(plan_mode):
+    """プランの権限から、プランの中身を持つファイルとディレクトリの権限を決める。
+
+    プランを読める相手にだけ中身を読ませ、書ける相手には作業ディレクトリにも書かせる。
+    持ち主（init を打つ利用者）は、元のプランの持ち主のビットに依らず読み書きできるようにする。
+    """
+    file_mode = (plan_mode & 0o066) | 0o600
+    dir_mode = 0o700
+    for read, write, rwx in ((0o040, 0o020, 0o050), (0o004, 0o002, 0o005)):
+        if plan_mode & read:
+            dir_mode |= rwx
+        if plan_mode & write:
+            dir_mode |= write
+    return file_mode, dir_mode
+
+
+def narrow_kept(path, file_mode):
+    """残すファイル（前の起動が作った写し）を、いまのプランの権限より広げない。
+
+    symlink の先・ふつうのファイルでないもの・ほかの利用者の物には触らない（外の権限を変えない）。
+    """
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+        return
+    narrowed = st.st_mode & 0o7777 & (file_mode | ~0o777)
+    if narrowed != st.st_mode & 0o7777:
+        os.chmod(str(path), narrowed)
 
 
 def clear_workdir(work):
@@ -515,10 +551,9 @@ def init(plan_arg):
         check_dir(pace_dir)
         check_dir(work)
         check_owner(plan, work)
-        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限より広げない。
-        # 0600 のプランを他の利用者に読ませないため。group は写さない（作るファイルの group は OS が決める）
-        plan_mode = plan.stat().st_mode & 0o777 & ~current_umask()
-        dir_mode = 0o700 | (0o050 if plan_mode & 0o040 else 0) | (0o005 if plan_mode & 0o004 else 0)
+        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限（umask を当てたもの）
+        # に合わせる。0600 のプランを他の利用者に読ませないため。group は写さない（作るファイルの group は OS が決める）
+        file_mode, dir_mode = modes_for(plan.stat().st_mode & 0o777 & ~current_umask())
     except OSError as e:
         raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     try:
@@ -532,15 +567,16 @@ def init(plan_arg):
         work.mkdir(mode=dir_mode, exist_ok=True)
         write_atomic(work / "source.json", source)
         clear_workdir(work)
-        write_atomic(work / "plan.md", data, plan_mode, plan_mode)
+        write_atomic(work / "plan.md", data, file_mode)
         lines = "".join(json.dumps(u, ensure_ascii=False) + "\n" for u in units)
-        write_atomic(work / "units.jsonl", lines.encode("utf-8"), plan_mode, plan_mode)
+        write_atomic(work / "units.jsonl", lines.encode("utf-8"), file_mode)
         shown = work / "shown.md"
-        if not shown.exists():
-            write_atomic(shown, data, plan_mode, plan_mode)
-        else:
-            # 前に広い権限で作った shown.md も、いまのプランの権限より広げない
-            os.chmod(str(shown), os.stat(str(shown)).st_mode & (plan_mode | ~0o777) & 0o7777)
+        if not os.path.lexists(str(shown)):
+            write_atomic(shown, data, file_mode)
+        # 前の起動が広い権限で作ったプランの写しも、いまのプランの権限より広げない
+        # （cache/ と rounds.jsonl はプランの写しを持たないので変えない）
+        narrow_kept(shown, file_mode)
+        narrow_kept(work / "show_snapshot.md", file_mode)
     except OSError as e:
         raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     print("units=%d" % len(units))
