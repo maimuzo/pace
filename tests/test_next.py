@@ -172,7 +172,7 @@ class NextTest(unittest.TestCase):
         self.assertTrue(Path(job["out_path"]).is_absolute())
         self.assertEqual(job["status"], "issued")
         self.assertEqual(job["cache_key"], "")
-        self.assertTrue(all(u["cache_key"] for u in job["input"]["units"]))
+        self.assertTrue(all("cache_key" not in u for u in job["input"]["units"]))  # 鍵はジョブに持たない
         self.assertIn("code_line", job["instructions"])
         self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE((self.work / "jobs").stat().st_mode), 0o700)
@@ -440,7 +440,7 @@ class NextTest(unittest.TestCase):
     # --- 止まる場面 ---------------------------------------------------------
 
     def test_stops_without_writing(self):
-        cases = ["changed", "no_units", "no_plan_copy", "unreadable", "other_plan", "not_init", "cache_symlink"]
+        cases = ["changed", "no_plan_copy", "unreadable", "other_plan", "not_init", "cache_symlink"]
         for case in cases:
             with self.subTest(case=case):
                 self.setUp()
@@ -448,8 +448,6 @@ class NextTest(unittest.TestCase):
                     self.init()
                 if case == "changed":
                     self.plan.write_text(PLAN + "足した。\n", encoding="utf-8")
-                elif case == "no_units":
-                    (self.work / "units.jsonl").unlink()
                 elif case == "no_plan_copy":
                     (self.work / "plan.md").unlink()
                 elif case == "unreadable":
@@ -477,16 +475,22 @@ class NextTest(unittest.TestCase):
             "round": ("jobs/round.json", "{}"),
             "job": (None, "[]"),
             "failed": ("failed_jobs.jsonl", "[]\n"),
-            "units": ("units.jsonl", "{}\n"),
+            "failed_job_id": ("failed_jobs.jsonl", '{"job_id": [1], "units": []}\n'),
+            "round_shape": ("jobs/round.json", '{"round": "zz"}'),
+            "attempts": (None, "ATTEMPTS"),
         }
         for case, (rel, text) in cases.items():
             with self.subTest(case=case):
                 self.setUp()
                 self.init()
                 bundles, _ = parse(self.next().stdout)
-                if case == "failed":
+                if case in ("failed", "failed_job_id"):
                     answer_all(bundles)  # 失敗の記録を読むのは、分類が終わって裁定を作るとき
                 path = Path(bundles[0][2][0]) if rel is None else self.work / rel
+                if text == "ATTEMPTS":
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    raw["attempts"] = -10 ** 30
+                    text = json.dumps(raw, ensure_ascii=False)
                 path.write_text(text, encoding="utf-8")
                 r = self.next(ok=False)
                 self.assertEqual(r.returncode, 1, case)
@@ -585,7 +589,7 @@ class NextTest(unittest.TestCase):
         self.assertEqual(self.reload(job)["attempts"], 1)
 
     def test_tampered_cache_key_and_variant_are_not_used(self):
-        """ジョブファイルの cache_key と variant は使わず、units.jsonl と列の ID から作り直す。"""
+        """ジョブファイルの cache_key と variant は使わず、プランから分け直した単位と列の ID から作り直す。"""
         self.init()
         bundles, _ = parse(self.next().stdout)
         outside = self.dir / "package.json"
@@ -608,26 +612,71 @@ class NextTest(unittest.TestCase):
         self.assertEqual(self.next().stdout.strip(), last)
 
     def test_bad_names_in_work_files_stop(self):
-        for case in ("created", "units"):
-            with self.subTest(case=case):
+        """列の ID は形を確かめる。形の違う名前のジョブは、中身が正しくても読まない。"""
+        self.init()
+        bundles, _ = parse(self.next().stdout)
+        d = self.work / "jobs" / "classify"
+        mark = d / "created.json"
+        info = json.loads(mark.read_text(encoding="utf-8"))
+        first = info["jobs"][0]
+        (d / "zzz.json").write_text((d / (first + ".json")).read_text(encoding="utf-8"), encoding="utf-8")
+        info["jobs"][0] = "zzz"
+        mark.write_text(json.dumps(info), encoding="utf-8")
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertIn("init を打ち直して", r.stderr)
+
+    def test_job_uids_must_be_plan_units(self):
+        for mode in ("unknown", "dup", "judge"):
+            with self.subTest(mode=mode):
                 self.setUp()
                 self.init()
-                self.next()
-                if case == "created":
-                    mark = self.work / "jobs" / "classify" / "created.json"
-                    info = json.loads(mark.read_text(encoding="utf-8"))
-                    info["jobs"][0] = "../../../../escaped"
-                    mark.write_text(json.dumps(info), encoding="utf-8")
+                if mode == "judge":
+                    target = self.units()[2]["id"]
+
+                    def labels(stage, variant, uid):
+                        return [decision(), decision()] if (uid == target and variant == "B") else [decision()]
+
+                    bundles, _ = parse(self.next().stdout)
+                    answer_all(bundles, labels)
+                    bundles, _ = parse(self.next().stdout)
+                    path = Path(bundles[0][2][0])
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    raw["input"]["unit"]["uid"] = self.units()[0]["id"]
                 else:
-                    lines = (self.work / "units.jsonl").read_text(encoding="utf-8").splitlines()
-                    u = json.loads(lines[0])
-                    u["id"] = "../x"
-                    lines[0] = json.dumps(u, ensure_ascii=False)
-                    (self.work / "units.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    bundles, _ = parse(self.next().stdout)
+                    path = Path(bundles[0][2][0])
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    if mode == "unknown":
+                        raw["input"]["units"][0]["uid"] = "uffffffff"
+                    else:
+                        raw["input"]["units"].append(dict(raw["input"]["units"][0]))
+                path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
                 r = self.next(ok=False)
-                self.assertEqual(r.returncode, 1, case)
-                self.assertNotIn("Traceback", r.stderr, case)
-                self.assertFalse(list(self.dir.glob("escaped*")))
+                self.assertEqual(r.returncode, 1, mode)
+                self.assertNotIn("Traceback", r.stderr, mode)
+
+    def test_units_jsonl_is_not_trusted(self):
+        """units.jsonl を書き換えても、next はプランから分け直した単位でノードを作る。"""
+        self.init()
+        first = self.drive()
+        nodes1 = (self.work / "nodes.jsonl").read_text(encoding="utf-8")
+        (self.work / "units.jsonl").write_text('{"id": "../x"}\n', encoding="utf-8")
+        self.assertEqual(self.next().stdout.strip(), first)
+        self.assertEqual((self.work / "nodes.jsonl").read_text(encoding="utf-8"), nodes1)
+
+    def test_more_than_999_jobs(self):
+        """片側の分類のジョブが1000件を超えても、名前の形の確かめで止まらない。"""
+        body = "".join("## 節%d\n\n文%d。\n\n" % (i, i) for i in range(1001))
+        self.plan.write_text("# 題\n\n" + body, encoding="utf-8")
+        self.init()
+        r = self.next()
+        self.assertTrue(r.stdout.strip().splitlines()[-1].startswith("WAVE"), r.stderr)
+        r = self.next()
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertTrue((self.work / "jobs" / "classify" / ("classify_A_1001_%s.json"
+                        % json.loads((self.work / "jobs" / "round.json").read_text())["round"])).exists())
 
     def test_old_nodes_removed_when_plan_unreadable(self):
         self.init()
