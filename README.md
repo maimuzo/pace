@@ -10,7 +10,7 @@ AI が書いた設計プランから根拠のグラフを作り、根拠の無�
 
 - macOS か Linux（確かめたのは macOS だけです）
 - Python 3.9 以上（標準ライブラリだけを使います。macOS の Command Line Tools の `python3` で動きます）
-- Claude Code（確かめたのは 2.1.301 です。この README の権限とモデルの話は、この版の振る舞いです）
+- Claude Code（確かめたのは 2.1.301 だけです。ほかの版では、権限とモデルの振る舞いが違いうります。たとえば公式文書の要約では、2.1.251 より前は `CLAUDE_CODE_SUBAGENT_MODEL` が agent の定義の `model` より優先されます）
 
 ## 入れ方
 
@@ -54,15 +54,21 @@ claude plugin marketplace add <checkout のパス>
 claude plugin install pace@pace
 ```
 
-入れたものは plugin の cache（commit の sha のディレクトリ）に写るので、編集を反映するには commit と、上の「更新」の2つのコマンドが要ることがあります。
-GitHub から入れた `pace` の marketplace が既にあるときは名前がぶつかるので、先に `claude plugin marketplace remove pace` で外してください。
+入れたものは plugin の cache（commit の sha のディレクトリ）に写ります。編集を反映するには、commit して（branch の形なら push もして）、入れたときと同じ scope で更新します。
+
+```bash
+claude plugin marketplace update pace
+claude plugin update pace@pace --scope local
+```
+
+どちらの形でも marketplace の名前は `pace` なので、GitHub の main から入れた `pace` が既にあるときは名前がぶつかります。先に `claude plugin marketplace remove pace` で外してください（そこから入れた plugin も使えなくなります）。
 
 ## 権限の設定
 
 **pace.py（Bash）**
 
-`/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。skill を起動したターンの間は、確認なしで叩けます。
-次に人間が発言すると、この許可は消えます（公式文書の要約）。
+`/pace:pace` は、skill の `allowed-tools` で `pace.py` を叩くことを許しています。公式文書の要約では、skill を起動したターンの間は確認なしで叩け、次に人間が発言すると、この許可は消えます。
+確かめたのは、user settings を読まない起動（`--setting-sources project,local`）で1回叩けたことだけです。同じターンの中で何度も叩いても許可が続くかは、確かめていません。
 
 **subagent の書き込み（Write）**
 
@@ -94,10 +100,10 @@ GitHub から入れた `pace` の marketplace が既にあるときは名前が�
 
 **プランは plan mode の外で書き、PACE も plan mode の外で起動してください。**
 
-plan mode のセッション（2.1.301）で確かめたところ、次のようになりました。
+plan mode のセッション（2.1.301、user settings を読まない起動）で1回ずつ試したところ、次のようになりました。
 
 - `/pace:pace`（`pace.py --version` を叩くだけ）は、確認なしで動きました。書き込みを伴う pace.py の段は、まだ無いので試していません。
-- 実行役の subagent にジョブを渡させると、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まりました。
+- 実行役の subagent にジョブを渡すよう手で頼むと、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まりました。
 - plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になりました。上の権限の規則は当たらない見込みです（推論。確かめていません）。
 
-PACE の1回の起動は subagent にジョブを渡すことを要するので、plan mode の中では回りません。
+PACE の1回の起動は subagent にジョブを渡すことを要するので、plan mode の中では回らないと判断しました。skill から subagent を呼ばせる形は後の版で作るので、そのときに確かめ直します。
