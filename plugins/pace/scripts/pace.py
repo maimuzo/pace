@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """PACE の機械の仕事を受け持つスクリプト。
 
-いまは --version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）を持つ。
-next・verify・report・show・shown は後の issue（maimuzo/pace#4 以降）で足す。
+いまは --version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）と
+next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化まで）を持つ。
+verify・report・show・shown は後の issue（maimuzo/pace#5 以降）で足す。
 Python 3.9 以上・標準ライブラリだけで動かす。分割と作業ディレクトリの決まりは
-docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）にある。
+docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは5節（パイプライン）にある。
 """
 
 import argparse
@@ -46,7 +47,8 @@ PRIVATE_DIR = 0o700
 class PaceError(Exception):
     """errors に数えない失敗（読む権限が無い・書けない・作業ディレクトリが使えない）。標準エラーに理由を出して 1 で終わる。
 
-    errors に数えるのは、プランが無いことと UTF-8 でないことだけ（docs/plans/pace_design.md の5節）。
+    errors に数えるのは、init がプランを読めない（無い・UTF-8 でない）ときだけ（docs/plans/pace_design.md の5節）。
+    next はプランを読めないときも、errors に数えずにこれで 1 で終わる。
     """
 
 
@@ -556,22 +558,541 @@ def init(plan_arg):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# next（ジョブ・束・検証・キャッシュ）
+# ---------------------------------------------------------------------------
+
+# 差し戻しの上限。attempts（検証に落ちた回数）が3のときにまた落ちたら、失敗したジョブにする。
+# docs/idea.md 付録B の MAX_ATTEMPTS（差し戻しの上限）と同じ値で、名前の取り違えを避けて RETRIES と呼ぶ
+MAX_RETRIES = 3
+CLASSIFY_BATCH = 30  # 分類の1ジョブの単位の数の上限（docs/idea.md 段2）
+NEIGHBORS = 2  # 分類と裁定に付ける前後の単位の数（キャッシュの鍵には入れない）
+# 束とジョブの大きさ。ジョブファイルの字数（指示文を含む）で数える。推論で決めた仮の値で、#9 で測り直す
+JOB_MAX_CHARS = 20000
+BUNDLE_MAX_CHARS = 60000
+BUNDLE_MAX_JOBS = 20
+PARALLEL = 4  # 1つの波に出す束の数の上限
+
+AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
+STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge"}
+JOB_STAGES = ("classify", "adjudicate")
+PTYPES = ("fact", "requirement", "value")
+
+# 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足したもの。
+# 変えるとキャッシュの鍵（指示文の sha256）が変わるので、古い答えは使われない。出力の形を変えたら段の版も上げる
+INSTRUCTIONS = {
+    "classify": """あなたは設計プランの文を分類する。input.units の各単位（文・箇条書き・表の1行・見出し・コードの1行）に、次のラベルを付けよ。単位の種類は kind にあり、code_line はコードブロックの中の1行である。
+- decision: プランが何かを選んでいて、要求を満たす別の選び方があり、選び方で振る舞いや作り方が変わるもの。「何を作る/作らない」「どう作る」「どの順」「何を例外にする」「何を出す/出さない」「数値・既定値」を全部含む。1単位に複数あれば分ける。text は一文で言い直した決定、alternatives は現実的な別案を1つ以上。
+- premise: 決定ではない前提。ptype は fact（現状の事実）/ requirement（満たすべき要求・目標）/ value（何を重視するか）。text は一文で言い直した前提。
+- 両方を含む単位には両方を付ける。どちらでもない単位は labels を空にする。迷ったら拾う側に倒す。
+各単位は独立に判断してよいが、section_path と neighbors で文脈を確かめること。
+出力は JSON: {"units":[{"uid":"...","labels":[{"kind":"decision","text":"...","alternatives":["..."]},{"kind":"premise","ptype":"fact","text":"..."}]}]}
+input.units のすべての uid を、過不足なく1回ずつ出すこと。""",
+    "adjudicate": """設計プランの1つの単位（input.unit。kind が code_line ならコードブロックの中の1行）について、2人の分類者の結果（input.A と input.B）が食い違った。基準に照らして正しいラベルを決めよ。
+基準: decision = プランが選んでいて、別の選び方があり、選び方で振る舞いや作り方が変わるもの（1単位に複数あれば分ける）。premise = 決定ではない前提で、ptype は fact / requirement / value。どちらでもなければ空。迷ったら拾う側に倒す。
+section_path と neighbors で文脈を確かめること。
+出力は JSON: {"labels":[{"kind":"decision","text":"...","alternatives":["..."]} | {"kind":"premise","ptype":"fact","text":"..."}]}""",
+}
+
+
+def dumps(obj):
+    """作業ディレクトリに書く JSON。日本語をそのまま書き、subagent が Read で読みやすいよう字下げする。"""
+    return json.dumps(obj, ensure_ascii=False, indent=1) + "\n"
+
+
+def sha256_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def read_regular(path):
+    """ふつうのファイルだけを読む。symlink・FIFO・ディレクトリは ValueError（FIFO を読むと戻らない）。"""
+    st = os.lstat(str(path))
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("ふつうのファイルではありません")
+    with open(str(path), "rb") as f:
+        return f.read()
+
+
+def load_work_json(path):
+    """作業ディレクトリの中の、pace.py が書いた JSON を読む。壊れていたら PaceError（init を打ち直す案内）。"""
+    try:
+        return json.loads(read_regular(path).decode("utf-8"))
+    except (OSError, ValueError, RecursionError) as e:
+        raise PaceError("%s を読めません（%s）。init を打ち直してください" % (path, e))
+
+
+def write_json(path, obj):
+    try:
+        data = dumps(obj).encode("utf-8")
+    except UnicodeEncodeError:
+        raise PaceError("作業ディレクトリのパスが UTF-8 で表せないので、ジョブを書けません: %s" % path.parent)
+    write_atomic(path, data, PRIVATE_FILE)
+
+
+def check_label(label, where):
+    """ラベル1つを確かめ、知らないキーを捨てたものを返す。誤りは ValueError。"""
+    if not isinstance(label, dict):
+        raise ValueError("%s のラベルがオブジェクトではありません" % where)
+    kind = label.get("kind")
+    text = label.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("%s のラベルの text が空でない文字列ではありません" % where)
+    if kind == "decision":
+        alts = label.get("alternatives")
+        if not isinstance(alts, list) or not alts or not all(isinstance(a, str) and a.strip() for a in alts):
+            raise ValueError("%s の decision の alternatives が、空でない文字列1つ以上の配列ではありません" % where)
+        return {"kind": "decision", "text": text, "alternatives": list(alts)}
+    if kind == "premise":
+        if label.get("ptype") not in PTYPES:
+            raise ValueError("%s の premise の ptype が fact / requirement / value のどれでもありません" % where)
+        return {"kind": "premise", "ptype": label["ptype"], "text": text}
+    raise ValueError("%s のラベルの kind が decision か premise ではありません" % where)
+
+
+def check_labels(labels, where):
+    if not isinstance(labels, list):
+        raise ValueError("%s の labels が配列ではありません" % where)
+    return [check_label(lab, where) for lab in labels]
+
+
+def check_classify(answer, job):
+    """分類の答えを確かめ、{uid: labels} を返す。"""
+    items = answer.get("units")
+    if not isinstance(items, list):
+        raise ValueError('"units" が配列ではありません')
+    want = [u["uid"] for u in job["input"]["units"]]
+    got = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("uid"), str):
+            raise ValueError('"units" の要素に uid がありません')
+        uid = item["uid"]
+        if uid not in want:
+            raise ValueError("入力に無い uid があります: %s" % uid)
+        if uid in got:
+            raise ValueError("uid が2回あります: %s" % uid)
+        got[uid] = check_labels(item.get("labels"), uid)
+    missing = [u for u in want if u not in got]
+    if missing:
+        raise ValueError("答えの無い uid があります: %s" % ", ".join(missing))
+    return got
+
+
+def check_adjudicate(answer, job):
+    return check_labels(answer.get("labels"), job["input"]["unit"]["uid"])
+
+
+def counts(labels):
+    return (sum(1 for x in labels if x["kind"] == "decision"), sum(1 for x in labels if x["kind"] == "premise"))
+
+
+class Round:
+    """1回の next が扱う、1つのプランの作業ディレクトリ。"""
+
+    def __init__(self, plan_arg):
+        self.plan = Path(plan_arg)
+        read = read_plan(self.plan)
+        if read is None:
+            raise PaceError("プランを読めません（無いか、UTF-8 ではありません）: %s。init を打ってください" % self.plan)
+        data = read[0]
+        pace_dir, self.work = workdir_for(self.plan)
+        self.jobs_dir = self.work / "jobs"
+        self.cache_dir = self.work / "cache"
+        try:
+            check_dir(pace_dir)
+            check_dir(self.work)
+            check_owner(self.plan, self.work)
+            check_dir(self.jobs_dir)
+            check_dir(self.cache_dir)
+        except OSError as e:
+            raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or self.work))
+        for name in ("units.jsonl", "plan.md"):
+            if not os.path.lexists(str(self.work / name)):
+                raise PaceError("%s がありません。init を打ってください" % (self.work / name))
+        try:
+            copy = read_regular(self.work / "plan.md")
+        except (OSError, ValueError) as e:
+            raise PaceError("%s を読めません（%s）。init を打ち直してください" % (self.work / "plan.md", e))
+        if copy != data:
+            raise PaceError("プランが init のあとで変わりました。init を打ち直してください: %s" % self.plan)
+        try:
+            lines = read_regular(self.work / "units.jsonl").decode("utf-8").splitlines()
+            self.units = [json.loads(line) for line in lines if line]
+        except (OSError, ValueError, RecursionError) as e:
+            raise PaceError("%s を読めません（%s）。init を打ち直してください" % (self.work / "units.jsonl", e))
+        # 前後の文は文書の中の位置で引く（節をまたいでよい。docs/idea.md 段2 の neighbors）
+        self.pos = {u["id"]: i for i, u in enumerate(self.units)}
+        source = self.work / "source.json"
+        self.plan_file = load_work_json(source)["plan_file"] if os.path.lexists(str(source)) else self.plan.name
+        self.agent_sha = {}
+
+    # --- 鍵とキャッシュ ---------------------------------------------------
+
+    def agent_digest(self, stage):
+        """段の agent の定義ファイルの sha256。定義（frontmatter の model を含む）を変えると鍵が変わる。"""
+        name = STAGE_AGENT[stage]
+        if name not in self.agent_sha:
+            try:
+                self.agent_sha[name] = hashlib.sha256(read_regular(AGENTS_DIR / (name + ".md"))).hexdigest()
+            except (OSError, ValueError) as e:
+                raise PaceError("agent の定義を読めません（%s）: %s" % (e, AGENTS_DIR / (name + ".md")))
+        return self.agent_sha[name]
+
+    def cache_key(self, stage, key_input):
+        version = dict(STAGE_VERSIONS)[stage]
+        material = [stage, version, sha256_text(INSTRUCTIONS[stage]), self.agent_digest(stage), key_input]
+        return sha256_text(json.dumps(material, ensure_ascii=False, sort_keys=True))
+
+    def classify_key(self, variant, unit):
+        # 前後の文は鍵に入れない（docs/idea.md 6.6。入れると1行の修正が周りへ揺れる）
+        return self.cache_key("classify", {"variant": variant, "plan_file": self.plan_file, "sec": unit["sec"],
+                                           "uid": unit["id"], "kind": unit["kind"], "section_path": unit["path"],
+                                           "text": unit["text"]})
+
+    def adjudicate_key(self, unit, a, b):
+        return self.cache_key("adjudicate", {"kind": unit["kind"], "section_path": unit["path"],
+                                             "text": unit["text"], "A": a, "B": b})
+
+    def cache_get(self, key):
+        path = self.cache_dir / (key + ".json")
+        if not os.path.lexists(str(path)):
+            return None
+        return load_work_json(path)["labels"]
+
+    def cache_put(self, key, labels):
+        make_private_dir(self.cache_dir)
+        write_json(self.cache_dir / (key + ".json"), {"labels": labels})
+
+    # --- ジョブ -----------------------------------------------------------
+
+    def round_id(self):
+        """周の印。init のあと最初の next が決め、ジョブの名前に入れる（前の起動の遅れた答えを見ないため）。"""
+        path = self.jobs_dir / "round.json"
+        if os.path.lexists(str(path)):
+            return load_work_json(path)["round"]
+        # 印が無いのに段のディレクトリがあれば、どの周のものか分からないので消す
+        if self.jobs_dir.exists():
+            clear_workdir(self.jobs_dir)
+        make_private_dir(self.jobs_dir)
+        rid = os.urandom(4).hex()
+        write_json(path, {"round": rid})
+        return rid
+
+    def stage_dir(self, stage):
+        return self.jobs_dir / stage
+
+    def created(self, stage, rid):
+        """段のジョブを作り終えていれば、ID の列を返す。作りかけ・前の周のものは消して None。"""
+        d = self.stage_dir(stage)
+        try:
+            check_dir(d)
+        except OSError as e:
+            raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, d))
+        mark = d / "created.json"
+        if os.path.lexists(str(mark)):
+            info = load_work_json(mark)
+            if info.get("round") == rid:
+                return info["jobs"]
+        if d.exists():
+            shutil.rmtree(str(d))
+        return None
+
+    def job_path(self, stage, job_id):
+        return self.stage_dir(stage) / (job_id + ".json")
+
+    def load_job(self, stage, job_id):
+        return load_work_json(self.job_path(stage, job_id))
+
+    def new_job(self, stage, job_id, job_input, cache_key=""):
+        d = self.stage_dir(stage)
+        return {"job_id": job_id, "stage": stage, "cache_key": cache_key,
+                "prompt_version": dict(STAGE_VERSIONS)[stage], "instructions": INSTRUCTIONS[stage],
+                "input": job_input, "out_path": str((d / (job_id + ".out.json")).absolute()),
+                "attempts": 0, "previous_errors": [], "status": "pending"}
+
+    def write_stage(self, stage, rid, jobs):
+        """段のジョブを全部書き、最後に created.json を書く（これが作り終えた印）。"""
+        d = self.stage_dir(stage)
+        make_private_dir(self.jobs_dir)
+        make_private_dir(d)
+        for job in jobs:
+            write_json(d / (job["job_id"] + ".json"), job)
+        ids = [job["job_id"] for job in jobs]
+        write_json(d / "created.json", {"round": rid, "count": len(ids), "jobs": ids})
+        return ids
+
+    def unit_entry(self, unit):
+        i = self.pos[unit["id"]]
+        near = self.units[max(0, i - NEIGHBORS):i] + self.units[i + 1:i + 1 + NEIGHBORS]
+        return {"uid": unit["id"], "kind": unit["kind"], "section_path": unit["path"], "text": unit["text"],
+                "neighbors": [u["text"] for u in near]}
+
+    def make_classify(self, rid):
+        """cache に無い単位だけで、節ごとに30単位・20,000字までの分類のジョブを A と B で作る。"""
+        sections = []
+        for unit in self.units:
+            if sections and sections[-1][0] == unit["sec"]:
+                sections[-1][1].append(unit)
+            else:
+                sections.append((unit["sec"], [unit]))
+        jobs = []
+        for variant in ("A", "B"):
+            seq = 0
+            groups = sections if variant == "A" else [(s, list(reversed(us))) for s, us in reversed(sections)]
+            for _, group in groups:
+                chunk = []
+                for unit in group:
+                    key = self.classify_key(variant, unit)
+                    if self.cache_get(key) is not None:
+                        continue
+                    entry = dict(self.unit_entry(unit), cache_key=key)
+                    if chunk:
+                        trial = self.new_job("classify", "x", {"units": chunk + [entry]})
+                        if len(chunk) >= CLASSIFY_BATCH or len(dumps(trial)) > JOB_MAX_CHARS:
+                            seq += 1
+                            jobs.append(self.new_job("classify", "classify_%s_%03d_%s" % (variant, seq, rid),
+                                                     {"units": chunk}))
+                            chunk = []
+                    chunk.append(entry)
+                if chunk:
+                    seq += 1
+                    jobs.append(self.new_job("classify", "classify_%s_%03d_%s" % (variant, seq, rid),
+                                             {"units": chunk}))
+        for job in jobs:
+            job["variant"] = job["job_id"].split("_")[1]
+        return jobs
+
+    def failed_units(self):
+        out = set()
+        for rec in self.failed_records():
+            out.update(rec.get("units", []))
+        return out
+
+    def failed_records(self):
+        path = self.work / "failed_jobs.jsonl"
+        if not os.path.lexists(str(path)):
+            return []
+        try:
+            return [json.loads(line) for line in read_regular(path).decode("utf-8").splitlines() if line]
+        except (OSError, ValueError, RecursionError) as e:
+            raise PaceError("%s を読めません（%s）。init を打ち直してください" % (path, e))
+
+    def classified(self, unit):
+        return self.cache_get(self.classify_key("A", unit)), self.cache_get(self.classify_key("B", unit))
+
+    def make_adjudicate(self, rid):
+        """A と B の決定の数・前提の数が食い違った単位だけ、裁定のジョブを作る（docs/idea.md 段2b）。"""
+        failed = self.failed_units()
+        jobs = []
+        for unit in self.units:
+            if unit["id"] in failed:
+                continue
+            a, b = self.classified(unit)
+            if a is None or b is None or counts(a) == counts(b):
+                continue
+            key = self.adjudicate_key(unit, a, b)
+            if self.cache_get(key) is not None:
+                continue
+            job_input = {"unit": self.unit_entry(unit), "A": a, "B": b}
+            jobs.append(self.new_job("adjudicate", "adjudicate_%s_%s" % (unit["id"], rid), job_input, key))
+        return jobs
+
+    # --- 判定 -------------------------------------------------------------
+
+    def judge(self, job):
+        """issued のジョブの答えを判定し、ジョブを done・pending（差し戻し）・failed に書き換える。"""
+        stage = job["stage"]
+        out = Path(job["out_path"])
+        error = None
+        answer = None
+        if not os.path.lexists(str(out)):
+            error = "out_path に答えが書かれていませんでした"
+        else:
+            try:
+                answer = json.loads(read_regular(out).decode("utf-8"))
+                if not isinstance(answer, dict):
+                    raise ValueError("答えが JSON のオブジェクトではありません")
+                result = check_classify(answer, job) if stage == "classify" else check_adjudicate(answer, job)
+            except (OSError, ValueError, RecursionError) as e:
+                error = "答えが検証に落ちました: %s" % e
+        path = self.job_path(stage, job["job_id"])
+        if error is None:
+            # キャッシュに書いてから done にする（間で落ちても、次の next が同じ答えを検証し直すだけ）
+            if stage == "classify":
+                keys = {u["uid"]: u["cache_key"] for u in job["input"]["units"]}
+                for uid, labels in result.items():
+                    self.cache_put(keys[uid], labels)
+            else:
+                self.cache_put(job["cache_key"], result)
+            job["status"] = "done"
+            write_json(path, job)
+            return
+        n = job["attempts"] + 1
+        if os.path.lexists(str(out)):
+            # 古い答えの名前を変えてから attempts を増やす（同じ名前で残すと、次の next が同じ答えを検証し直す）
+            os.replace(str(out), str(out.parent / ("%s.rejected-%d.json" % (job["job_id"], n))))
+        job["attempts"] = n
+        job["previous_errors"].append(error)
+        if n > MAX_RETRIES:
+            # 記録を先に書いてから failed にする。記録は job_id で重ねない
+            if job["job_id"] not in {r.get("job_id") for r in self.failed_records()}:
+                units = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
+                         else [job["input"]["unit"]["uid"]])
+                rec = {"job_id": job["job_id"], "stage": stage, "units": units, "errors": job["previous_errors"]}
+                path_f = self.work / "failed_jobs.jsonl"
+                old = read_regular(path_f) if os.path.lexists(str(path_f)) else b""
+                line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+                write_atomic(path_f, old + line, PRIVATE_FILE)
+            job["status"] = "failed"
+        else:
+            job["status"] = "pending"
+        write_json(path, job)
+
+    # --- 波 ---------------------------------------------------------------
+
+    def bundles(self, stage, jobs):
+        """pending のジョブを束にする。A と B は別の束にし、交互に並べる。"""
+        groups = {}
+        for job in jobs:
+            groups.setdefault(job.get("variant", ""), []).append(job)
+        per_group = []
+        for variant in sorted(groups):
+            out = []
+            cur, size = [], 0
+            for job in groups[variant]:
+                n = len(dumps(job))
+                if cur and (size + n > BUNDLE_MAX_CHARS or len(cur) >= BUNDLE_MAX_JOBS):
+                    out.append(cur)
+                    cur, size = [], 0
+                cur.append(job)
+                size += n
+            if cur:
+                out.append(cur)
+            per_group.append(out)
+        mixed = []
+        for i in range(max(len(g) for g in per_group)):
+            for g in per_group:
+                if i < len(g):
+                    mixed.append(g[i])
+        return mixed
+
+    def emit(self, stage, pending):
+        chosen = self.bundles(stage, pending)[:PARALLEL]
+        wave = []
+        for k, bundle in enumerate(chosen, start=1):
+            for job in bundle:
+                job["status"] = "issued"
+                write_json(self.job_path(stage, job["job_id"]), job)
+            wave.append({"bundle_id": "b%03d" % k, "agent": "pace:" + STAGE_AGENT[stage],
+                         "jobs": [str(self.job_path(stage, job["job_id"]).absolute()) for job in bundle]})
+        write_json(self.work / "pending.json", {"bundles": wave})
+        lines = []
+        for b in wave:
+            lines.append("BUNDLE %s %s" % (b["bundle_id"], b["agent"]))
+            lines.extend("JOB %s" % p for p in b["jobs"])
+        lines.append("WAVE bundles=%d jobs=%d" % (len(wave), sum(len(b["jobs"]) for b in wave)))
+        return lines
+
+    # --- ノード化 ----------------------------------------------------------
+
+    def nodes(self):
+        failed = self.failed_units()
+        result = []
+        for unit in self.units:
+            if unit["id"] in failed:
+                continue
+            a, b = self.classified(unit)
+            if a is None or b is None:
+                raise PaceError("単位 %s の分類の答えがありません。init を打ち直してください" % unit["id"])
+            labels = a
+            if counts(a) != counts(b):
+                labels = self.cache_get(self.adjudicate_key(unit, a, b))
+                if labels is None:
+                    raise PaceError("単位 %s の裁定の答えがありません。init を打ち直してください" % unit["id"])
+            stem = unit["id"][1:]
+            seen = {"decision": 0, "premise": 0}
+            for lab in labels:
+                seen[lab["kind"]] += 1
+                node = {"id": "%s_%s_%d" % ("D" if lab["kind"] == "decision" else "P", stem, seen[lab["kind"]]),
+                        "kind": lab["kind"]}
+                if lab["kind"] == "premise":
+                    node["ptype"] = lab["ptype"]
+                node["text"] = lab["text"]
+                if lab["kind"] == "decision":
+                    node["alternatives"] = lab["alternatives"]
+                node.update({"unit": unit["id"], "line": unit["line"], "sec": unit["sec"], "path": unit["path"]})
+                result.append(node)
+        return result
+
+    def run(self):
+        rid = self.round_id()
+        # (1) issued のジョブだけを判定する
+        for stage in JOB_STAGES:
+            ids = self.created(stage, rid)
+            for job_id in ids or []:
+                job = self.load_job(stage, job_id)
+                if job.get("status") == "issued":
+                    self.judge(job)
+        # (2) 段を前から順に見る。ジョブが残っている段で止める
+        for stage in JOB_STAGES:
+            ids = self.created(stage, rid)
+            if ids is None:
+                jobs = self.make_classify(rid) if stage == "classify" else self.make_adjudicate(rid)
+                ids = self.write_stage(stage, rid, jobs)
+            pending = []
+            waiting = False
+            for job_id in ids:
+                job = self.load_job(stage, job_id)
+                if job.get("status") == "pending":
+                    pending.append(job)
+                elif job.get("status") == "issued":
+                    waiting = True
+            if pending:
+                return self.emit(stage, pending)
+            if waiting:
+                # 出したジョブの答えを待っている（判定のあとなので、ここには来ない見込み）
+                raise PaceError("答えを待っているジョブがあります。束を subagent に渡してから打ってください")
+        # (3) 全部の段を通った。網羅を確かめてノード化する
+        nodes = self.nodes()
+        write_atomic(self.work / "nodes.jsonl",
+                     "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in nodes).encode("utf-8"),
+                     PRIVATE_FILE)
+        write_json(self.work / "pending.json", {"bundles": []})
+        decisions = sum(1 for n in nodes if n["kind"] == "decision")
+        return ["DONE decisions=%d premises=%d failed_jobs=%d"
+                % (decisions, len(nodes) - decisions, len(self.failed_records()))]
+
+
+def next_(plan_arg):
+    try:
+        lines = Round(plan_arg).run()
+    except OSError as e:
+        raise PaceError("作業ディレクトリに書けませんでした（%s）: %s" % (e.strerror or e, e.filename or plan_arg))
+    try:
+        sys.stdout.write("".join(line + "\n" for line in lines))
+    except UnicodeEncodeError:
+        raise PaceError("ジョブのパスが UTF-8 で表せないので、出力できません")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pace.py", description="PACE の機械の仕事を受け持つ")
     parser.add_argument("--version", action="store_true", help="段ごとの版の一覧を出す")
     sub = parser.add_subparsers(dest="command")
     p_init = sub.add_parser("init", help="プランを単位に分けて作業ディレクトリに置く")
     p_init.add_argument("plan", help="プランのパス")
+    p_next = sub.add_parser("next", help="前の波の答えを取り込み、次の波の束を出す")
+    p_next.add_argument("plan", help="プランのパス")
     args = parser.parse_args(argv)
     if args.version:
         for name, version in STAGE_VERSIONS:
             print(f"{name} {version}")
         return 0
-    if args.command == "init":
+    commands = {"init": init, "next": next_}
+    if args.command in commands:
         try:
-            return init(args.plan)
+            return commands[args.command](args.plan)
         except PaceError as e:
-            print("pace.py init: %s" % e, file=sys.stderr)
+            print("pace.py %s: %s" % (args.command, e), file=sys.stderr)
             return 1
     parser.print_help(sys.stderr)
     return 2
