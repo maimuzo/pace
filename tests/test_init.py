@@ -131,6 +131,22 @@ class InitTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertEqual(list(real.iterdir()), [])
 
+    def test_symlink_workdir_is_refused(self):
+        other = self.dir / "other"
+        other.mkdir()
+        (other / "keep.txt").write_text("x")
+        self.pace.mkdir()
+        os.symlink(str(other), str(self.work))
+        r = self.init()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("symlink", r.stderr)
+        self.assertEqual(sorted(p.name for p in other.iterdir()), ["keep.txt"])
+
+    def test_pace_dir_that_is_a_file_is_refused(self):
+        self.pace.write_text("x")
+        self.assertEqual(self.init().returncode, 1)
+        self.assertEqual(self.pace.read_text(), "x")
+
     def test_workdir_that_is_a_file_is_refused(self):
         self.pace.mkdir()
         self.work.write_text("x")

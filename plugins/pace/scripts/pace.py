@@ -45,10 +45,10 @@ class PaceError(Exception):
 LINE_END = re.compile(r"\r\n|\r|\n")
 QUOTE_MARK = re.compile(r"[ \t]*>[ \t]?")
 FENCE_OPEN = re.compile(r"[ \t]*(`{3,}|~{3,})(.*)")
-HEADING = re.compile(r" {0,3}(#{1,6})(?:[ \t]+(.*))?")
+HEADING = re.compile(r"[ \t]{0,3}(#{1,6})(?:[ \t]+(.*))?")
 HEADING_CLOSE = re.compile(r"[ \t]+#+[ \t]*$")
-RULE = re.compile(r" {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
-TABLE = re.compile(r" {0,3}\|")
+RULE = re.compile(r"[ \t]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*")
+TABLE = re.compile(r"[ \t]{0,3}\|")
 TABLE_SEPARATOR = re.compile(r":?-+:?")
 BULLET = re.compile(r"[ \t]*(?:[-*+]|[0-9]+[.)])(?:[ \t]+(.*))?")
 SPACES = re.compile(r"\s+")
@@ -121,9 +121,13 @@ def join_pieces(pieces):
         piece = piece.strip()
         if not piece:
             continue
-        # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる
-        if raw and (ord(raw[-1]) < 128 or ord(piece[0]) < 128):
-            raw += " "
+        # 日本語どうしの折り返しだけを詰め、片側でも ASCII なら空白1つを入れる。
+        # 端の ** はあとで外すので、その内側の字で決める（「**重要**」で折り返しても本文を変えない）
+        if raw:
+            last = raw.rstrip("*")[-1:] or raw[-1]
+            first = piece.lstrip("*")[:1] or piece[0]
+            if ord(last) < 128 or ord(first) < 128:
+                raw += " "
         starts.append((len(raw), line_no))
         raw += piece
     return raw, starts
@@ -263,6 +267,9 @@ def split_units(text):
             close_block()
             level = len(m.group(1))
             title = normalize(HEADING_CLOSE.sub("", m.group(2) or ""))
+            if not title:
+                # 本文の無い見出しは、単位にも文書の構造にもしない
+                continue
             if depth > 0:
                 # 引用の中の見出しは、文書の構造（path・sec）を進めない
                 emit("heading", line_no, title)

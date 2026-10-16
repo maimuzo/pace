@@ -62,6 +62,8 @@ class JoinTest(unittest.TestCase):
         self.assertEqual([u["text"] for u in split("日本語の   \n折り返し。")], ["日本語の折り返し。"])
         # 片側でも ASCII なら空白を入れる（折り返す位置で本文が変わらないように）
         self.assertEqual([u["text"] for u in split("設定が\n`cfg` にある")], ["設定が `cfg` にある"])
+        # 端の ** は外すので、その内側の字で決める
+        self.assertEqual([u["text"] for u in split("**重要**\nです。")], ["重要です。"])
 
     def test_blank_line_starts_new_paragraph(self):
         self.assertEqual([u["text"] for u in split("一つ目\n\n二つ目")], ["一つ目", "二つ目"])
@@ -126,6 +128,9 @@ class TableTest(unittest.TestCase):
         # 空のセルも残す。空白は1つに詰めるので、空のセルは "| |" になる
         self.assertEqual(kinds_texts("| `a\\|b` | | c |"), [("table_row", "`a|b` | | c")])
 
+    def test_empty_edge_cells(self):
+        self.assertEqual(kinds_texts("| | a | |"), [("table_row", "| a |")])
+
     def test_row_without_trailing_pipe(self):
         self.assertEqual(kinds_texts("| a | b"), [("table_row", "a | b")])
 
@@ -136,6 +141,14 @@ class TableTest(unittest.TestCase):
 class HeadingTest(unittest.TestCase):
     def test_closing_hashes(self):
         self.assertEqual(kinds_texts("## C#\n## 題 ##"), [("heading", "C#"), ("heading", "題")])
+
+    def test_tab_counts_as_one_indent(self):
+        self.assertEqual(kinds_texts("\t# 題\n\t| a |\n\t---\n本文"),
+                         [("heading", "題"), ("table_row", "a"), ("sentence", "本文")])
+
+    def test_empty_heading_is_ignored(self):
+        units = split("## 節\n##\n本文。")
+        self.assertEqual([(u["kind"], u["path"]) for u in units], [("heading", []), ("sentence", ["節"])])
 
     def test_path_and_sec(self):
         units = split("# 一\n## 二\n### 三\n本文。\n# 次の一\n本文。")
