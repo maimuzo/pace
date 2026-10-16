@@ -635,10 +635,11 @@ def is_str_list(obj):
 
 
 def valid_job(obj):
-    """ジョブファイルの形。中の値（uid と cache_key）まで見る。
+    """ジョブファイルの形（段・試行・理由・状態と、入力の uid の形）。
 
-    out_path と job_id はファイルの値を使わず、段のディレクトリと created.json の列から作り直す
-    （ジョブファイルは Edit(**/.pace/**) の許可で書き換えられうるので、作業ディレクトリの外を指させない）。
+    ジョブファイルは Edit(**/.pace/**) の許可で書き換えられうるので、パスやキャッシュの鍵になる値
+    （job_id・out_path・cache_key・variant）はファイルから使わない。load_job と judge が、created.json の列の ID と
+    units.jsonl から作り直す（作業ディレクトリの外を指させない）。
     """
     if not (isinstance(obj, dict) and obj.get("stage") in JOB_STAGES and isinstance(obj.get("attempts"), int)
             and is_str_list(obj.get("previous_errors")) and isinstance(obj.get("input"), dict)
@@ -647,10 +648,9 @@ def valid_job(obj):
     if obj["stage"] == "classify":
         units = obj["input"].get("units")
         return isinstance(units, list) and bool(units) and all(
-            isinstance(u, dict) and isinstance(u.get("uid"), str) and isinstance(u.get("cache_key"), str)
-            for u in units)
+            isinstance(u, dict) and isinstance(u.get("uid"), str) for u in units)
     unit = obj["input"].get("unit")
-    return isinstance(unit, dict) and isinstance(unit.get("uid"), str) and isinstance(obj.get("cache_key"), str)
+    return isinstance(unit, dict) and isinstance(unit.get("uid"), str)
 
 
 def encodable(text):
@@ -661,6 +661,10 @@ def encodable(text):
     except UnicodeEncodeError:
         return False
 
+
+# 作業ディレクトリのファイルから読んでパスに使う名前の形。ほかの形（`../` を含むものなど）は形の誤りとして断る
+UNIT_ID = re.compile(r"u[0-9a-f]{8}(?:_[0-9]+)?")
+JOB_ID = re.compile(r"(?:classify_([AB])_[0-9]{3}|adjudicate_(u[0-9a-f]{8}(?:_[0-9]+)?))_[0-9a-f]{8}")
 
 # 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
 ERROR_MAX_CHARS = 300
@@ -736,10 +740,6 @@ class Round:
 
     def __init__(self, plan_arg):
         self.plan = Path(plan_arg)
-        read = read_plan(self.plan)
-        if read is None:
-            raise PaceError("プランを読めません（無いか、UTF-8 ではありません）: %s。init を打ってください" % self.plan)
-        data = read[0]
         pace_dir, self.work = workdir_for(self.plan)
         self.jobs_dir = self.work / "jobs"
         self.cache_dir = self.work / "cache"
@@ -751,14 +751,19 @@ class Round:
             check_dir(self.cache_dir)
         except OSError as e:
             raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or self.work))
-        # nodes.jsonl は DONE のときだけ書く。前の DONE のものを残すと、プランが変わった・網羅が欠けたなどで
-        # 1 で終わったあとも古いノードを後の段が読むので、作業ディレクトリを確かめたらすぐ消す
+        # nodes.jsonl は DONE のときだけ書く。前の DONE のものを残すと、プランが変わった・読めない・網羅が欠けた
+        # などで 1 で終わったあとも古いノードを後の段が読むので、作業ディレクトリがこのプランのものと確かめたら、
+        # プランを読むより先に消す
         nodes_path = self.work / "nodes.jsonl"
         try:
             if os.path.lexists(str(nodes_path)):
                 os.unlink(str(nodes_path))
         except OSError as e:
             raise PaceError("%s を消せませんでした（%s）" % (nodes_path, e.strerror or e))
+        read = read_plan(self.plan)
+        if read is None:
+            raise PaceError("プランを読めません（無いか、UTF-8 ではありません）: %s。init を打ってください" % self.plan)
+        data = read[0]
         for name in ("units.jsonl", "plan.md"):
             if not os.path.lexists(str(self.work / name)):
                 raise PaceError("%s がありません。init を打ってください" % (self.work / name))
@@ -773,7 +778,8 @@ class Round:
             self.units = [json.loads(line) for line in lines if line]
         except (OSError, ValueError, RecursionError) as e:
             raise PaceError("%s を読めません（%s）。init を打ち直してください" % (self.work / "units.jsonl", e))
-        if not all(isinstance(u, dict) and isinstance(u.get("id"), str) and isinstance(u.get("text"), str)
+        if not all(isinstance(u, dict) and isinstance(u.get("id"), str) and UNIT_ID.fullmatch(u["id"])
+                   and isinstance(u.get("text"), str)
                    and isinstance(u.get("kind"), str) and isinstance(u.get("sec"), str)
                    and is_str_list(u.get("path")) and isinstance(u.get("line"), int) for u in self.units):
             raise PaceError("%s の形が違います。init を打ち直してください" % (self.work / "units.jsonl"))
@@ -855,7 +861,8 @@ class Round:
             raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, d))
         mark = d / "created.json"
         if os.path.lexists(str(mark)):
-            info = load_work_json(mark, lambda o: isinstance(o, dict) and is_str_list(o.get("jobs")))
+            info = load_work_json(mark, lambda o: isinstance(o, dict) and is_str_list(o.get("jobs"))
+                                  and all(JOB_ID.fullmatch(j) for j in o["jobs"]))
             if info.get("round") == rid:
                 return info["jobs"]
         if d.exists():
@@ -868,9 +875,19 @@ class Round:
     def load_job(self, stage, job_id):
         """列の ID のジョブを読む。job_id と out_path は、ファイルの値でなく段のディレクトリと ID から決める。"""
         path = self.job_path(stage, job_id)
+        m = JOB_ID.fullmatch(job_id)
         job = load_work_json(path, lambda o: valid_job(o) and o["stage"] == stage)
+        if stage == "classify":
+            uids = [u["uid"] for u in job["input"]["units"]]
+            ok = m.group(1) is not None and all(u in self.pos for u in uids) and len(set(uids)) == len(uids)
+        else:
+            ok = m.group(2) is not None and job["input"]["unit"]["uid"] == m.group(2) and m.group(2) in self.pos
+        if not ok:
+            raise PaceError("%s の形が違います。init を打ち直してください" % path)
         job["job_id"] = job_id
         job["out_path"] = str((self.stage_dir(stage) / (job_id + ".out.json")).absolute())
+        if stage == "classify":
+            job["variant"] = m.group(1)
         return job
 
     def new_job(self, stage, job_id, job_input, cache_key="", variant=None):
@@ -995,12 +1012,16 @@ class Round:
         path = self.job_path(stage, job["job_id"])
         if error is None:
             # キャッシュに書いてから done にする（間で落ちても、次の next が同じ答えを検証し直すだけ）
+            # 鍵はジョブファイルの cache_key でなく、units.jsonl とキャッシュから作り直す（外を指させない）
             if stage == "classify":
-                keys = {u["uid"]: u["cache_key"] for u in job["input"]["units"]}
                 for uid, labels in result.items():
-                    self.cache_put(keys[uid], labels)
+                    self.cache_put(self.classify_key(job["variant"], self.units[self.pos[uid]]), labels)
             else:
-                self.cache_put(job["cache_key"], result)
+                unit = self.units[self.pos[job["input"]["unit"]["uid"]]]
+                a, b = self.classified(unit)
+                if a is None or b is None:
+                    raise PaceError("単位 %s の分類の答えがありません。init を打ち直してください" % unit["id"])
+                self.cache_put(self.adjudicate_key(unit, a, b), result)
             job["status"] = "done"
             write_json(path, job)
             return

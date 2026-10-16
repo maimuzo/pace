@@ -584,6 +584,59 @@ class NextTest(unittest.TestCase):
         self.assertFalse(list(self.dir.glob("escaped*")))
         self.assertEqual(self.reload(job)["attempts"], 1)
 
+    def test_tampered_cache_key_and_variant_are_not_used(self):
+        """ジョブファイルの cache_key と variant は使わず、units.jsonl と列の ID から作り直す。"""
+        self.init()
+        bundles, _ = parse(self.next().stdout)
+        outside = self.dir / "package.json"
+        outside.write_text('{"name": "app"}\n', encoding="utf-8")
+        for _, _, paths in bundles:
+            for p in paths:
+                raw = json.loads(Path(p).read_text(encoding="utf-8"))
+                for u in raw["input"]["units"]:
+                    u["cache_key"] = "../../../package"
+                raw["cache_key"] = "/tmp/x"
+                raw["variant"] = "A"
+                Path(p).write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        answer_all([(b, a, ps) for b, a, ps in bundles])
+        last = self.drive()
+        self.assertTrue(last.startswith("DONE"), last)
+        self.assertEqual(outside.read_text(encoding="utf-8"), '{"name": "app"}\n')
+        self.assertEqual(list(self.dir.glob("*.json")), [outside])
+        # 作り直した鍵でキャッシュに入っているので、init し直すとジョブは出ない
+        self.init()
+        self.assertEqual(self.next().stdout.strip(), last)
+
+    def test_bad_names_in_work_files_stop(self):
+        for case in ("created", "units"):
+            with self.subTest(case=case):
+                self.setUp()
+                self.init()
+                self.next()
+                if case == "created":
+                    mark = self.work / "jobs" / "classify" / "created.json"
+                    info = json.loads(mark.read_text(encoding="utf-8"))
+                    info["jobs"][0] = "../../../../escaped"
+                    mark.write_text(json.dumps(info), encoding="utf-8")
+                else:
+                    lines = (self.work / "units.jsonl").read_text(encoding="utf-8").splitlines()
+                    u = json.loads(lines[0])
+                    u["id"] = "../x"
+                    lines[0] = json.dumps(u, ensure_ascii=False)
+                    (self.work / "units.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+                r = self.next(ok=False)
+                self.assertEqual(r.returncode, 1, case)
+                self.assertNotIn("Traceback", r.stderr, case)
+                self.assertFalse(list(self.dir.glob("escaped*")))
+
+    def test_old_nodes_removed_when_plan_unreadable(self):
+        self.init()
+        self.drive()
+        self.plan.write_bytes(b"\xff\xfe")
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse((self.work / "nodes.jsonl").exists())
+
     def test_tampered_job_input_stops(self):
         bundles, job = self.first_job()
         path = self.work / "jobs" / "classify" / (job["job_id"] + ".json")
