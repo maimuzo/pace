@@ -5,7 +5,7 @@
 next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化まで）を持つ。
 verify・report・show・shown は後の issue（maimuzo/pace#5 以降）で足す。
 Python 3.9 以上・標準ライブラリだけで動かす。分割と作業ディレクトリの決まりは
-docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは5節（パイプライン）にある。
+docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは14節（ジョブと束）にある。
 """
 
 import argparse
@@ -802,12 +802,16 @@ class Round:
     def load_job(self, stage, job_id):
         return load_work_json(self.job_path(stage, job_id))
 
-    def new_job(self, stage, job_id, job_input, cache_key=""):
+    def new_job(self, stage, job_id, job_input, cache_key="", variant=None):
         d = self.stage_dir(stage)
-        return {"job_id": job_id, "stage": stage, "cache_key": cache_key,
+        job = {"job_id": job_id, "stage": stage}
+        if variant:
+            job["variant"] = variant
+        job.update({"cache_key": cache_key,
                 "prompt_version": dict(STAGE_VERSIONS)[stage], "instructions": INSTRUCTIONS[stage],
                 "input": job_input, "out_path": str((d / (job_id + ".out.json")).absolute()),
-                "attempts": 0, "previous_errors": [], "status": "pending"}
+                "attempts": 0, "previous_errors": [], "status": "pending"})
+        return job
 
     def write_stage(self, stage, rid, jobs):
         """段のジョブを全部書き、最後に created.json を書く（これが作り終えた印）。"""
@@ -846,19 +850,19 @@ class Round:
                         continue
                     entry = dict(self.unit_entry(unit), cache_key=key)
                     if chunk:
-                        trial = self.new_job("classify", "x", {"units": chunk + [entry]})
+                        # 字数は、実際に付ける名前と同じ長さの名前で測る（out_path の長さも字数に入る）
+                        trial = self.new_job("classify", "classify_%s_%03d_%s" % (variant, seq + 1, rid),
+                                             {"units": chunk + [entry]}, variant=variant)
                         if len(chunk) >= CLASSIFY_BATCH or len(dumps(trial)) > JOB_MAX_CHARS:
                             seq += 1
                             jobs.append(self.new_job("classify", "classify_%s_%03d_%s" % (variant, seq, rid),
-                                                     {"units": chunk}))
+                                                     {"units": chunk}, variant=variant))
                             chunk = []
                     chunk.append(entry)
                 if chunk:
                     seq += 1
                     jobs.append(self.new_job("classify", "classify_%s_%03d_%s" % (variant, seq, rid),
-                                             {"units": chunk}))
-        for job in jobs:
-            job["variant"] = job["job_id"].split("_")[1]
+                                             {"units": chunk}, variant=variant))
         return jobs
 
     def failed_units(self):

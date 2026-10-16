@@ -1,4 +1,4 @@
-"""pace.py next の unittest。決まりは docs/plans/pace_design.md の5節（パイプライン）と9節（作業ディレクトリ）。
+"""pace.py next の unittest。決まりは docs/plans/pace_design.md の14節（ジョブと束）と9節（作業ディレクトリ）。
 
 テストが実行役（subagent）の代わりに *.out.json を書き、next を subprocess で叩く。
 鍵の計算だけは test_split.py と同じく import して確かめる（指示文と agent の定義を差し替えるため）。
