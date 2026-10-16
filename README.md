@@ -109,7 +109,7 @@ claude plugin marketplace remove pace --scope local
 
 plan mode のセッション（2.1.301、user settings を読まない起動）で1回ずつ試したところ、次のようになりました。
 
-- `/pace:pace`（`pace.py --version` を叩くだけ）は、確認なしで動きました。書き込みを伴う pace.py の段は、まだ無いので試していません。
+- `/pace:pace`（`pace.py --version` を叩くだけ）は、確認なしで動きました。書き込みを伴う pace.py の段（`init`）は、plan mode では試していません。
 - 実行役の subagent にジョブを渡すよう手で頼むと、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まりました。
 - plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になりました。上の権限の規則は当たらない見込みです（推論。確かめていません）。
 
