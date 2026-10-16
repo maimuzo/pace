@@ -28,7 +28,7 @@ SKILL.md は周を回し、書き手に3種類の文だけを書かせ、起動�
 `plugin.json` には version を書かない。動く環境は macOS と Linux の Python 3.9 以上で、標準ライブラリだけを使う。
 
 ```text
-.claude-plugin/marketplace.json          {"name": "pace", "owner": {"name": "maimuzo"}, "plugins": [{"name": "pace", "source": "./plugins/pace"}]}
+.claude-plugin/marketplace.json          {"name": "pace", "owner": {"name": "maimuzo"}, "metadata": {"description": "…"}, "plugins": [{"name": "pace", "source": "./plugins/pace", "description": "…"}]}
 plugins/pace/.claude-plugin/plugin.json  {"name": "pace", "description": "…", "author": {"name": "maimuzo"}}
 plugins/pace/skills/pace/SKILL.md        周の回し方。メインのセッションでインラインに動く。/pace:pace [--no-ask] <プランのパス>
 plugins/pace/agents/pace-worker.md       model: sonnet / tools: Read, Write。分類・根拠付け
@@ -46,11 +46,17 @@ tests/                                   plugins/pace の外に置く（plugin �
 | agent に Bash を持たせない | 実行役がスクリプトを書いて済ませるのを道具の側で止める（[../idea.md:509](../idea.md#L509)） |
 | 判定役を opus、ほかを sonnet。SKILL.md は呼び出しで model を渡さない | [../idea.md:513](../idea.md#L513) の使い分けを、呼び出し側の設定に左右されないようにする |
 | Python 3.9 以上・標準ライブラリだけ | macOS の Command Line Tools の python3 が 3.9 で、入れる手順が要らない。Windows は確かめていないので対象に入れない |
+| SKILL.md の `allowed-tools` を `Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)` にし、本文に同じ文字列で `--version` などを書く | plugin の skill では、本文と `allowed-tools` の2か所で `${CLAUDE_PLUGIN_ROOT}` が置き換わる（公式文書の要約）。#2 で、`--plugin-dir` で読んだものと branch から入れたもの（cache の sha のディレクトリ）の両方で、確認なしで叩けた |
+| 許可が効くのは、skill を起動したターンの間だけ | 次に人間が発言すると消える（公式文書の要約）。1回の起動の前半を人間の発言を挟まずに回せば、その間は確認が出ない見込み（推論。同じターンで何度も叩けるかは [#4](https://github.com/maimuzo/pace/issues/4) で確かめる） |
+| subagent の書き込みは、利用者が settings に `Edit(**/.pace/**)` を足して許す（README に書く） | plugin の agent では `permissionMode` が無視され、親の権限を受け継ぐ。ファイルの規則は Edit と Read で見られ、Write の規則は見られない（公式文書の要約）。#2 で、この規則を足した `manual` のモードで、pace-worker と pace-judge が確認なしに書けた |
+| モデルの差し替えは、利用者が settings の `env` に `CLAUDE_CODE_SUBAGENT_MODEL` と `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` を書く（README に書く。確かめていない） | API など subagent 以外の実行役への差し替えは、ジョブを JSON ファイルで渡す形（[../idea.md:310](../idea.md#L310)）が受け皿なので、仕組みを足さない |
+| `pace.py --version` は、AI に頼む段（`classify`・`adjudicate`・`link`・`decycle`・`review`）ごとに `<段の名前> <版>` を1行ずつ出す。版の形は `2026-10-16.1` | 版はキャッシュの鍵に入る（[../idea.md:316](../idea.md#L316)）ので、鍵を持つ段だけに付ける。名前は [../idea.md:801-846](../idea.md#L801-L846)、形は [../idea.md:475](../idea.md#L475) の `prompt_version` に揃える |
+| マージ前に手元から試すときは `claude --plugin-dir <checkout>/plugins/pace`。入れて試すなら `claude plugin marketplace add <checkout のパス>` → `claude plugin install pace@pace`（README に書く） | `--plugin-dir` はそのセッションだけ読み込み、利用者の設定を変えない。入れた plugin は cache に写るので、編集の反映には commit と update が要ることがある |
 
 - agent の呼び名は `pace:pace-worker` と `pace:pace-judge` である（plugin の agent に名前空間が付く実例: `maimuzo-issue-manage:bug-reporter`）。
-- スクリプトは `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py"` で呼ぶ。展開されないときは、skill を読み込んだときに示される skill のディレクトリから `../../scripts/pace.py` を辿る。どちらにするかは [#2](https://github.com/maimuzo/pace/issues/2) で決める。
+- スクリプトは `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py"` で呼ぶ。`${CLAUDE_PLUGIN_ROOT}` が置き換わらないときは、黙って別の経路で叩かずに止まる。退けた経路は、skill のディレクトリから `../../scripts/pace.py` を辿る形で、置き換えの不具合を隠すため採らない。
 
-**後から足す案。**ExitPlanMode の hook から skill を促す形。[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている。skill ができてから足せる（どこでループを動かすかは実装段階で決めてよい。[../idea.md:98](../idea.md#L98)）。
+**後から足す案。**ExitPlanMode の hook から skill を促す形。[../idea.md:656](../idea.md#L656) はプラン承認時の検証を勧めている。skill ができてから足せる（どこでループを動かすかは実装段階で決めてよい。[../idea.md:98](../idea.md#L98)）。ただし PACE は plan mode の中では回らない（[限界](#10-限界)）ので、促すなら plan mode を出たあとに回す形になる。
 
 **退けた案。**version を書いて PR ごとに上げる: 上の表の理由で採らない。
 
@@ -256,7 +262,9 @@ NEXT: continue
 - 人間の回答が決定として分類されると、同じ質問がまた出ることがある。
 - 判定役とプランの書き手が同じモデルになることがある（[../idea.md:212](../idea.md#L212)）。
 - 誰が何を言ったか（S1・S4・idea.md 11章）は扱わない。入力は1本のプランに限る（S2・W2）。人間の回答を書き写すときの改変は照合しない。扱う段は [#10](https://github.com/maimuzo/pace/issues/10) の計画で、回答の書き写し方とあわせて決める。
-- plan mode の中で動かないときは、plan mode の外でプランファイルを書く使い方に限る（plan mode を出るのは人間の承認なので、出てから回すと「設計を完了させる前」にならない）。動くかは [#2](https://github.com/maimuzo/pace/issues/2) で確かめる。
+- **plan mode の中では回らない。**プランは plan mode の外で書き、PACE も plan mode の外で起動する使い方に限る（plan mode を出るのは人間の承認なので、出てから回すと「設計を完了させる前」にならない）。[#2](https://github.com/maimuzo/pace/issues/2) で確かめた（Claude Code 2.1.301）: plan mode でも pace.py の Bash は確認なしで通るが、subagent にジョブを渡させると、subagent を呼ばずにプランを書き、plan mode を抜けてよいかの確認で止まった。plan mode のプランは `~/.claude/plans/` に置かれ、作業ディレクトリの外になる。
+- subagent の書き込みを許す規則（`Edit(**/.pace/**)`。[配り方とプラグインの形](#2-配り方とプラグインの形)）は、プランが Claude Code を起動したディレクトリの下にあるときにしか当たらない。subagent に限らず、メインのセッションの `.pace/` への書き込みにも効く（公式文書の要約。確かめていない）ので、書き手が `*.out.json` を自分で書いても確認では気づけない。
+- 判定役の `model: opus` が使えるかは、利用者の環境（契約・プロバイダ）ごとに違い、確かめていない。組織の `availableModels` で禁じられていれば、許された版に置き換わるか、親のセッションのモデルで動く（公式文書の要約）。`CLAUDE_CODE_SUBAGENT_MODEL` と `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` で差し替えると、全部の subagent が同じモデルになり、pace-worker と pace-judge の使い分けが消える。
 
 ---
 
@@ -283,14 +291,13 @@ NEXT: continue
 
 ## 12. 残っている論点
 
-**言いたいこと。**次の論点は、受け持つ issue の計画で決める。各 issue の本文の「設計レビューで残った論点」にも同じものがある。
+**言いたいこと。**次の論点は、受け持つ issue の計画で決める。各 issue の本文の「設計レビューで残った論点」にも同じものがある（#2 から #4・#7 へ移した論点は、issue の本文への追記待ち）。
 
 | 受け持つ issue | 論点 |
 | --- | --- |
-| [#2](https://github.com/maimuzo/pace/issues/2) | subagent の Write と pace.py の Bash で、権限の確認が周ごとに出ないか（`allowed-tools`。#2 の決めることにもある）。判定役の `model: opus` が利用者の環境で使えるか、使えないときの差し替え（idea.md 2.6 の差し替え可能） |
 | [#3](https://github.com/maimuzo/pace/issues/3) | 同じディレクトリに拡張子だけが違う同名のプランがあると、作業ディレクトリがぶつかる |
-| [#4](https://github.com/maimuzo/pace/issues/4) | `*.out.json` を書かなかったジョブを試行に数えるか。キャッシュの鍵に agent の定義やモデルの別名が入らないこと |
-| [#7](https://github.com/maimuzo/pace/issues/7) | show.md のコードブロックがプランの中の ``` で閉じる。errors のときに古い show_snapshot.md が残る。「最後に見せてから何周か」と「初回」を判定する記録の置き場所。`--no-ask` のときの決まり3と伏せ処理の上下・0 以外で終わったときに返すもの。決まり4の範囲・注記の問いと質問の重なり・show.md の中のパスの基準。init が `NEXT: show` を出したときの分かれ道・停止の条件の書き分け・性質4と5の show.md の形。境目の行の形と、show.md・questions.md・report.md・`--no-ask` が返すものの見本。決まり3・4を pace.py で確かめるか（境目より前の sha256 など） |
+| [#4](https://github.com/maimuzo/pace/issues/4) | `*.out.json` を書かなかったジョブを試行に数えるか。キャッシュの鍵に agent の定義やモデルの別名が入らないこと。同じターンの中で pace.py を何度も叩き、間に subagent を挟んでも、`allowed-tools` の許可が続くか（#2 から移した。#2 は1回叩けることだけを確かめた） |
+| [#7](https://github.com/maimuzo/pace/issues/7) | 書き手のプランの Edit・注記の Edit・ターンのあとの `shown`・回答のあとに書き手が起動し直した skill・`--no-ask` で呼ばれたときに、権限の確認が出ないか（#2 から移した）。show.md のコードブロックがプランの中の ``` で閉じる。errors のときに古い show_snapshot.md が残る。「最後に見せてから何周か」と「初回」を判定する記録の置き場所。`--no-ask` のときの決まり3と伏せ処理の上下・0 以外で終わったときに返すもの。決まり4の範囲・注記の問いと質問の重なり・show.md の中のパスの基準。init が `NEXT: show` を出したときの分かれ道・停止の条件の書き分け・性質4と5の show.md の形。境目の行の形と、show.md・questions.md・report.md・`--no-ask` が返すものの見本。決まり3・4を pace.py で確かめるか（境目より前の sha256 など） |
 | [#9](https://github.com/maimuzo/pace/issues/9) | 「公開してよいか分からない中身は書かない」で質問が増えすぎないか。限界の節のうち、作り込むものの判断 |
 | [#10](https://github.com/maimuzo/pace/issues/10) | `--no-ask` で返すものを公開のコメントへ写すときの伏せ方 |
 
