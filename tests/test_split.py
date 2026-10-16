@@ -209,25 +209,34 @@ class FenceTest(unittest.TestCase):
 
 
 class SpeedTest(unittest.TestCase):
-    def test_large_inputs_are_not_quadratic(self):
+    @staticmethod
+    def _time(text):
         import time
-        # 入力ごとに時間を測り、1つずつ2秒と比べる。2乗の版では、この機（Python 3.9.6）で
-        # 4万行の段落 10秒・`a`** の4万回 38秒・* の160万個 8秒・8万の空白の見出し 15秒・
-        # 閉じない backtick の幅1,200種 18秒・** で終わる40万行 8秒・> の160万段 約17秒かかった。
-        # 線形の版はどれも0.7秒に届かないので、速さが数倍違う機でも見分けられる
-        inputs = [
-            ("段落", "。\n".join(["文"] * 40000)),
-            ("backtick と **", "`a`**" * 40000),
-            ("行末の *", "a" + "*" * 1600000 + "\nb"),
-            ("見出しの空白", "# a" + " " * 80000 + "b"),
-            ("閉じない backtick", "".join("`" * k + " " for k in range(1200, 1, -1)) + "`a` " * 100000),
-            ("** で終わる行", "a**\n" * 400000),
-            ("深い引用", ">" * 1600000 + " x"),
-        ]
-        for name, text in inputs:
+        best = None
+        for _ in range(2):
             start = time.monotonic()
             split(text)
-            self.assertLess(time.monotonic() - start, 2.0, name)
+            took = time.monotonic() - start
+            best = took if best is None else min(best, took)
+        return best
+
+    def test_large_inputs_are_not_quadratic(self):
+        # 入力ごとに、大きさを2倍にしたときの時間の伸びを比べる。線形なら約2倍、2乗なら約4倍になるので、
+        # 機の速さに依らず見分けられる。2乗の書き方をしていた前の版（0a50e2f・f0a20de）では、このテストが
+        # 落ちることを確かめた（** で終わる行が 0.63秒 → 2.14秒、閉じない backtick が 0.59秒 → 2.35秒。Python 3.9.6）
+        builders = [
+            ("段落", lambda n: "。\n".join(["文"] * n)),
+            ("backtick と **", lambda n: "`a`**" * n),
+            ("行末の *", lambda n: "a" + "*" * (40 * n) + "\nb"),
+            ("見出しの空白", lambda n: "# a" + " " * (2 * n) + "b"),
+            ("閉じない backtick", lambda n: "".join("`" * k + " " for k in range(n // 100, 1, -1)) + "`a` " * n),
+            ("** で終わる行", lambda n: "a**\n" * (5 * n)),
+            ("深い引用", lambda n: ">" * (20 * n) + " x"),
+        ]
+        for name, build in builders:
+            small = self._time(build(20000))
+            large = self._time(build(40000))
+            self.assertLess(large, 3.0 * small + 0.05, "%s: %.3f秒 → %.3f秒" % (name, small, large))
 
 
 class SentenceTest(unittest.TestCase):
@@ -249,6 +258,10 @@ class SentenceTest(unittest.TestCase):
 
 
 class NormalizeTest(unittest.TestCase):
+    def test_bold_only_line_inside_code_span(self):
+        # ** だけの行のつなぎ目は、その前に入れた空白を最後の字として見る
+        self.assertEqual([u["text"] for u in split("`日本\n**\n語`")], ["`日本 ** 語`"])
+
     def test_bold_is_removed_outside_code(self):
         self.assertEqual([u["text"] for u in split("**強い。**`Edit(**/.pace/**)` を足す。")],
                          ["強い。", "`Edit(**/.pace/**)` を足す。"])

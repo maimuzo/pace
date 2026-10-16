@@ -412,7 +412,8 @@ def workdir_for(plan):
     """
     pace_dir = plan.parent / ".pace"
     name = plan.stem
-    if name in ("", ".", "..", ".gitignore"):
+    # 大文字と小文字を区別しない FS では .GITIGNORE も .pace/.gitignore とぶつかるので、小文字で比べる
+    if name in ("", ".", "..") or name.lower() == ".gitignore":
         raise PaceError("プランの名前 %s からは作業ディレクトリの名前を作れないので、何も書きません。プランの名前を変えてください" % plan.name)
     return pace_dir, pace_dir / name
 
@@ -494,31 +495,34 @@ def write_atomic(path, data, new_mode=None):
 
 
 def modes_for(plan_mode):
-    """プランの権限から、プランの中身を持つファイルとディレクトリの権限を決める。
+    """プランの権限から、(ファイル, 作業ディレクトリ, .pace/) の権限を決める。
 
-    プランを読める相手にだけ中身を読ませ、書ける相手には作業ディレクトリにも書かせる。
-    持ち主（init を打つ利用者）は、元のプランの持ち主のビットに依らず読み書きできるようにする。
+    プランを読める相手にだけ中身を読ませ、書ける相手には、そのプランの作業ディレクトリにも書かせる。
+    .pace/ には持ち主のほかに書く権限を渡さない（渡すと、同じディレクトリの別のプランの作業ディレクトリを
+    他人が差し替えられる）。持ち主（init を打つ利用者）は、元のプランの持ち主のビットに依らず読み書きできる。
     """
     file_mode = (plan_mode & 0o066) | 0o600
-    dir_mode = 0o700
-    for read, write, rwx in ((0o040, 0o020, 0o050), (0o004, 0o002, 0o005)):
+    work_mode = pace_mode = 0o700
+    for read, write, rx in ((0o040, 0o020, 0o050), (0o004, 0o002, 0o005)):
         if plan_mode & read:
-            dir_mode |= rwx
+            work_mode |= rx
+            pace_mode |= rx
         if plan_mode & write:
-            dir_mode |= write
-    return file_mode, dir_mode
+            work_mode |= write
+    return file_mode, work_mode, pace_mode
 
 
 def narrow_kept(path, file_mode):
-    """残すファイル（前の起動が作った写し）を、いまのプランの権限より広げない。
+    """残すファイル（前の起動が作った写し）を、file_mode より広い分だけ狭める（広げはしない）。
 
-    symlink の先・ふつうのファイルでないもの・ほかの利用者の物には触らない（外の権限を変えない）。
+    symlink・ふつうのファイルでないもの・hard link（ほかのパスと中身を分け合うもの）・ほかの利用者の物には
+    触らない（作業ディレクトリの外の権限を変えない）。
     """
     try:
         st = os.lstat(str(path))
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
         return
     narrowed = st.st_mode & 0o7777 & (file_mode | ~0o777)
     if narrowed != st.st_mode & 0o7777:
@@ -551,9 +555,9 @@ def init(plan_arg):
         check_dir(pace_dir)
         check_dir(work)
         check_owner(plan, work)
-        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限（umask を当てたもの）
-        # に合わせる。0600 のプランを他の利用者に読ませないため。group は写さない（作るファイルの group は OS が決める）
-        file_mode, dir_mode = modes_for(plan.stat().st_mode & 0o777 & ~current_umask())
+        # プランの中身を持つもの（写し・units.jsonl・作業ディレクトリ）は、元のプランの権限（umask を当てたもの）を
+        # 持ち主のほかには広げない。0600 のプランを他の利用者に読ませないため。group は写さない（OS が決める）
+        file_mode, work_mode, pace_mode = modes_for(plan.stat().st_mode & 0o777 & ~current_umask())
     except OSError as e:
         raise PaceError("作業ディレクトリを確かめられませんでした（%s）: %s" % (e.strerror or e, e.filename or work))
     try:
@@ -562,9 +566,9 @@ def init(plan_arg):
         raise PaceError("プランの名前が UTF-8 で表せないので、何も書きません。プランの名前を変えてください")
     units = split_units(text)
     try:
-        pace_dir.mkdir(mode=dir_mode, exist_ok=True)
+        pace_dir.mkdir(mode=pace_mode, exist_ok=True)
         write_atomic(pace_dir / ".gitignore", b"*\n")
-        work.mkdir(mode=dir_mode, exist_ok=True)
+        work.mkdir(mode=work_mode, exist_ok=True)
         write_atomic(work / "source.json", source)
         clear_workdir(work)
         write_atomic(work / "plan.md", data, file_mode)
@@ -573,8 +577,8 @@ def init(plan_arg):
         shown = work / "shown.md"
         if not os.path.lexists(str(shown)):
             write_atomic(shown, data, file_mode)
-        # 前の起動が広い権限で作ったプランの写しも、いまのプランの権限より広げない
-        # （cache/ と rounds.jsonl はプランの写しを持たないので変えない）
+        # 前の起動が広い権限で作ったプランの写しを、いまの権限まで狭める。shown.md が symlink なら、
+        # 何を指していても触らない（cache/ と rounds.jsonl はプランの写しを持たないので変えない）
         narrow_kept(shown, file_mode)
         narrow_kept(work / "show_snapshot.md", file_mode)
     except OSError as e:
