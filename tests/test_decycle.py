@@ -330,6 +330,32 @@ class DecycleFlowTest(FlowBase):
         (self.work / "cache" / (rnd.memory_key(node) + ".json")).write_text('{"cuts": [{"from_text": 1}]}')
         self.assertEqual(pace.Round(str(self.plan), readonly=True).memory_get(node), [])
 
+    def test_memory_of_another_pass_or_round_does_not_pass_the_check(self):
+        """walk の確かめは、いまの周の印と pass=k の記憶だけを数える。理由は書き直す。"""
+        self.init()
+        self.drive()
+        rnd = pace.Round(str(self.plan))
+        a = rnd.node_by_id(self.ids()["決定Aを選ぶ。"])
+        b = rnd.node_by_id(self.ids()["決定Bを選ぶ。"])
+        path = self.work / "cache" / (rnd.memory_key(a) + ".json")
+        good = path.read_text(encoding="utf-8")
+        # pass を別の回にすると walk の痕跡の確かめで、round を前の周の印にすると（回1から効くので）回1の入力の
+        # 作り直しで、どちらも 1 で終わる
+        for key, value, message in (("pass", 2, "切った辺の記憶がありません"), ("round", "00000000", "形が違います")):
+            obj = json.loads(good)
+            obj["cuts"][0][key] = value
+            path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+            r = self.verify(ok=False)
+            self.assertEqual(r.returncode, 1, key)
+            self.assertIn(message, r.stderr)
+            self.assertIn("init を打ち直して", r.stderr)
+        path.write_text(good, encoding="utf-8")
+        rid = rnd.round_id()
+        rnd.memory_add(a, b, "新しい理由", rid, 1)
+        cuts = pace.Round(str(self.plan), readonly=True).memory_get(a)
+        self.assertEqual([(c["reason"], c["round"], c["pass"]) for c in cuts], [("新しい理由", rid, 1)])
+        self.verify()
+
     def test_decycle_failure_is_unverified_not_cycle(self):
         self.init()
         last, _ = self.drive(decycle=lambda job: None)
@@ -487,6 +513,61 @@ class OtherPlanFlowTest(FlowBase):
         rnd.memory_add(a2, y, "r", rid, 1)
         froms = sorted(c["from_text"] for c in pace.Round(str(self.plan), readonly=True).memory_get(a1))
         self.assertEqual(froms, ["決定Xを選ぶ。", "決定Yを選ぶ。"])
+
+
+    def test_r2_trimmed_to_nothing_makes_the_decision_unverified(self):
+        """足す候補はあったが40,000字で全部削った決定は、r1 の答えのまま U に入り unverified になる。"""
+        far = "理由の文" + "あ" * 45000 + "。"
+        self.use("# 題\n\n## 節\n\n決定Aを選ぶ。\n\n## 遠く\n\n" + "".join("埋め%d。\n\n" % i for i in range(9)) + far + "\n")
+
+        def link(job):
+            target = job["input"]["target"]
+            return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "t"}], "need": ["理由の文"],
+                    "steps": [{"from": ["g1"], "to": target["id"], "warrant": "理由"}]}
+        last, waves = self.drive(link=link)
+        self.assertTrue(last.startswith("DONE decisions=1 "), last)
+        stages = {json.loads(Path(p).read_text(encoding="utf-8"))["stage"] for w in waves for _, _, ps in w for p in ps}
+        self.assertNotIn("link_r2_1", stages)  # r2 は作られない
+        out = self.verify().stdout.splitlines()
+        a = self.ids()["決定Aを選ぶ。"]
+        self.assertIn("DECISION %s unverified" % a, out)
+        self.assertIn("GAP G_%s_g1 fact uncertain" % a, out)
+
+    def test_same_text_decisions_cut_in_one_wave_reach_done(self):
+        """同じ文の決定 A1・A2 がそれぞれ X・Y と輪になり、同じ波で両方を切っても、次の next は止まらない。"""
+        self.use("# 題\n\n## 設計1\n\n決定Aを選ぶ。\n決定Xを選ぶ。\n\n## 設計2\n\n決定Aを選ぶ。\n決定Yを選ぶ。\n")
+        partner = {"決定Aを選ぶ。": ("決定Xを選ぶ。", "決定Yを選ぶ。"), "決定Xを選ぶ。": ("決定Aを選ぶ。",),
+                   "決定Yを選ぶ。": ("決定Aを選ぶ。",)}
+
+        def link(job):
+            target = job["input"]["target"]
+            froms = [n["id"] for g in job["input"]["candidates"] for n in g["nodes"]
+                     if g["section"] == target["section"] and g["plan_text"] in partner[target["plan_text"]]]
+            if froms:
+                return {"claims": [], "gaps": [], "need": [],
+                        "steps": [{"from": froms, "to": target["id"], "warrant": "理由"}]}
+            return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "t"}], "need": [],
+                    "steps": [{"from": ["g1"], "to": target["id"], "warrant": "理由"}]}
+
+        def decycle(job):
+            ids = {n["id"]: n["plan_text"] for n in job["input"]["nodes"]}
+            e = next(e for e in job["input"]["edges"] if ids[e["to"]] == "決定Aを選ぶ。")
+            return {"cuts": [{"from": e["from"], "to": e["to"], "reason": "理由ではない"}]}
+        last, waves = self.drive(link=link, decycle=decycle)
+        self.assertTrue(last.startswith("DONE decisions=4 "), last)
+        dec = [p for w in waves for _, _, ps in w for p in ps if Path(p).name.startswith("decycle_1_")]
+        self.assertEqual(len(dec), 2)  # 2つの輪を同じ波で断った
+        self.verify()
+        self.assertEqual(parse(self.next().stdout)[1], last)
+
+    def test_exclusions_take_every_decision_of_the_same_text(self):
+        self.use("# 題\n\n## 設計1\n\n決定Aを選ぶ。\n決定Xを選ぶ。\n\n## 設計2\n\n決定Aを選ぶ。\n")
+        self.drive()
+        rnd = pace.Round(str(self.plan))
+        a1, a2 = [n for n in rnd.decisions() if n["text"] == "決定Aを選ぶ。"]
+        x = next(n for n in rnd.decisions() if n["text"] == "決定Xを選ぶ。")
+        rnd.memory_add(x, a1, "r", "00000000", 1)  # 前の周に切った記憶
+        self.assertEqual(pace.Round(str(self.plan), readonly=True).exclusions(1, x), frozenset({a1["id"], a2["id"]}))
 
 
 if __name__ == "__main__":
