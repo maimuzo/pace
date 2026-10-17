@@ -34,7 +34,7 @@ plugins/pace/skills/pace/SKILL.md        周の回し方。メインのセッシ
 plugins/pace/agents/pace-worker.md       model: sonnet / tools: Read, Write。分類・根拠付け
 plugins/pace/agents/pace-judge.md        model: opus / tools: Read, Write。裁定・輪を断つ・反論
 plugins/pace/scripts/pace.py             --version（段ごとの版の一覧）/ init / next / verify / report / show / shown（--version 以外はプランのパスを取る）
-tests/                                   plugins/pace の外に置く（plugin のキャッシュに入れないため）。test_split.py は sys.path に plugins/pace/scripts を足して import pace し（__pycache__ をプラグインに書かない）、test_init.py・test_next.py・test_link.py・test_decycle.py・test_review.py・test_report.py は sys.executable で pace.py を叩く（test_next.py は束の分け方・鍵の計算・定数を、test_link.py は候補・2-gram・根拠付けの答えの検証を、test_decycle.py は強連結成分・輪を断つ答えの検証・強さと効きの計算を、test_review.py は反論の答えの検証を、test_report.py は囲みとインラインコードの形を import して確かめ、根拠付けの答えはテストのプロセスの中で Round を作ってキャッシュから引く。test_review.py と test_report.py は test_decycle.py の流れの道具を使う）。python3 -m unittest discover -s tests
+tests/                                   plugins/pace の外に置く（plugin のキャッシュに入れないため）。test_split.py は sys.path に plugins/pace/scripts を足して import pace し（__pycache__ をプラグインに書かない）、test_init.py・test_next.py・test_link.py・test_decycle.py・test_review.py・test_report.py・test_cache.py は sys.executable で pace.py を叩く（test_next.py は束の分け方・鍵の計算・定数を、test_link.py は候補・2-gram・根拠付けの答えの検証を、test_decycle.py は強連結成分・輪を断つ答えの検証・強さと効きの計算を、test_review.py は反論の答えの検証を、test_report.py は囲みとインラインコードの形を import して確かめ、根拠付けの答えはテストのプロセスの中で Round を作ってキャッシュから引く。test_review.py と test_report.py は test_decycle.py の流れの道具を使う。test_cache.py は test_decycle.py（`RING_PLAN` を含む）と test_report.py の道具を使い、1周目のあとの作業ディレクトリをプランごと写してキャッシュありとなしの2周目を比べる）。python3 -m unittest discover -s tests
 ```
 
 | 決めたこと | 根拠 |
@@ -188,7 +188,7 @@ sequenceDiagram
 | `report.md` | 全体。周・件数・決定ごとの状態・反論の全部（refuted も）・残った輪・切った辺（参考）・確かめられなかったもの |
 | `fixes.md` | 書き手が直すもの。並びは、足りない事実の gap（止めている決定の数の多い順）→ accepted の反論 → 輪を断つ段を5回回しても残った輪 → 根拠の無い決定。項目には、その gap を持つ決定（反論なら審査した決定）の原文を引く（行番号は参考）。残った輪には輪の辺と warrant を添える |
 | `questions.md` | 人間が決めるもの。価値判断の gap と要求の gap（本文が同じものは1つにまとめる）を止めている決定の数の順に並べ、gap を持つ決定の原文と分類の段で出た別案を添える。needs_human の反論も入れる。根拠を前提に限るので、根に届かない反証は起きない（17節） |
-| `rounds.jsonl` | 周ごとの report の行と、`shown` の行（`"kind"` で見分ける。18節） |
+| `rounds.jsonl` | 周ごとの report の行（その周に AI に出したジョブの数 `jobs` を含む）と、`shown` の行（`"kind"` で見分ける。18節・19節） |
 | `show.md` | 人間に見せるもの。質問／残った fixes／確かめられなかった決定と単位／最後に見せてからのプランの差分（削除も出る）／「差分の中の事実・価値の文・回答の引用と、境目より後ろの注記は書き手が書いたもので、照合していない」という注意、の5つと境目の行（21節） |
 
 見本（`report` の標準出力。見本どうしは別の状態の例で、件数を揃えない）:
@@ -220,7 +220,7 @@ NEXT: continue
 
 - 順1が性質1の「書き手が直さなかったとき」である。1つ前の周に失敗したジョブがあれば、この周は失敗したジョブを出し直したので結果が変わりうるため、「直さなかった」とはみなさない。見せたあとの最初の周には比べる相手が無いので当てない（見せた周は決まり4で直せなかったので、残った fixes を直す周に戻れるようにする）。
 - 順3は failed_jobs を見ない（性質1の「fixes が0件のとき止める」）。失敗したジョブはキャッシュに入らないので、次に回る周で出し直される。毎回失敗するジョブがあると、順2の上限まで回る（10節）。
-- 書き手に直せない fixes だけが残ったら、書き手はプランを変えずに次の周へ進む。キャッシュが当たり（AI のジョブは失敗したものだけ）、順1で show になる。書き手の申告で後半へ飛ぶ形は採らない。
+- 書き手に直せない fixes だけが残ったら、書き手はプランを変えずに次の周へ進む。キャッシュが当たり（AI のジョブは失敗したものだけ）、順1で show になる。書き手の申告で後半へ飛ぶ形は採らない。ただし回6で輪が残ったときは、次の周の最初の回から切った辺の記憶が効き、残った輪をもう一度断つので、ジョブが出て fixes が変わったまま順1で show になる（書き手は変わった fixes を直す周を経ずに見せる）。書き手が輪をほどいた周でも、記憶が効き続けて結果がキャッシュの有無で変わることがある（[限界](#10-限界)。どちらも、別の issue で直す対象のいまの振る舞い）。
 - 「終わり」と言えるのは `errors=0 failed_jobs=0 fixes=0 questions=0` のときだけで、それ以外は、何が残っているかを見せて終わる。
 
 **後半。**`show` が show.md と写しを書き、写しの sha256 を出す。書き手は境目の行より後ろに注記（残した fixes を書かずに残した理由と、人間への問いだけ）を足してよい。見せたあと `shown <プラン> <sha256>` を打つ。
@@ -266,7 +266,7 @@ NEXT: continue
 - 場所: `<プランと同じディレクトリ>/.pace/<プランのファイル名の拡張子を除いたもの>/`（例 `docs/plans/impl/.pace/issue224_config_reload/`）。中の構成は [../idea.md:484-498](../idea.md#L484-L498) の表に、上の節で足したファイルを加えたもの（`results/`・`stats_*.json`・`summary.json`・`graph.jsonl` は作らない。`next` が書くのは `jobs/`・`cache/`・`pending.json`・`failed_jobs.jsonl`・`nodes.jsonl`（14節）、`report` が書くのは `report.md`・`fixes.md`・`questions.md`・`rounds.jsonl`（18節）、`show` が書くのは `show.md`・`show_snapshot.md`、`shown` が書くのは `shown.md`・`rounds.jsonl`（21節））。プランを読めないときの `show` は、`.pace/` と作業ディレクトリが無ければ作り、`.gitignore` を `init` と同じく書く。`source.json` は書かない（無ければ `check_owner` がいまのプランのものとみなすので、あとの `init` は通る。打ち間違えたパスの名前を控えて、正しいプランの `init` を止めないため）。
 - `init` は、プランを読めて作業ディレクトリを確かめたあと（下の順の5）に、`<プランと同じディレクトリ>/.pace/.gitignore`（中身は `*` の1行）を書く。`git status --porcelain` は無視されたファイルを出さないので、commit に入らず、worktree の片付けも止まらない。
 - `init` は `cache/`・`rounds.jsonl`・`shown.md`・`show_snapshot.md` を残し、ほかを作り直す（P5 とキャッシュの両立。[../idea.md:69](../idea.md#L69)・[../idea.md:316](../idea.md#L316)）。作り直しで書くのは `plan.md`（プランのバイトの写し）・`units.jsonl`・`source.json`（元のプランのファイル名。`design.markdown` なら `{"plan_file": "design.markdown"}`。これも残す）で、`shown.md` は無いときだけプランの写しで作る。`.pace/` の中は、`init` を打った利用者だけが読み書きする（新しく作るファイルは 0600、`.pace/` と作業ディレクトリは 0700 に、umask に依らず揃える）。プランの中身を他の利用者に読ませないためで、プランの権限には合わせない。一時ファイルの権限は、パスでなく開いたファイルに付ける。既にあるファイル（`.gitignore`・`source.json`）は、いまの権限を写す。symlink の `shown.md` は、何を指していても触らない。pace.py が書くファイルとディレクトリは 0600 と 0700 に揃えるが、subagent が Write で書く `*.out.json` と、その名前を変えた `rejected-*` は Write の権限のまま（0700 の作業ディレクトリの中なので、ほかの利用者からは読めない）。
-- キャッシュ無しで測るときは、`cache/` を空にしてから回す。
+- キャッシュ無しで測るときは、`cache/` を空にしてから回す。`cache/` を空にすると切った辺の記憶も消えるので、キャッシュありと結果が変わりうる（[限界](#10-限界)）。
 
 **`init` の判定の順（[#3](https://github.com/maimuzo/pace/issues/3)）。**作業ディレクトリの中身を変えるのは、プランを読めて、そこがいまのプランのものと確かめたあとだけにする。
 1. プランを読む。無い（ディレクトリ・FIFO などふつうのファイルでないもの・途中がファイルのパス・輪になった symlink も含む）か UTF-8 でなければ、`PACE-STATUS: errors=1 failed_jobs=0 fixes=0 questions=0` と `NEXT: show` を出して 0 で終わる。`.pace/` には何も作らず、何も消さない（語幹が同じ別のプランの作業ディレクトリを消さないため）。
@@ -299,6 +299,7 @@ NEXT: continue
 - 分割は次の形を扱わない: 箇条書きの中で4つ以上字下げした表と見出し（箇条書きの本文につながる）・4つ字下げのコードブロック（段落か箇条書きの本文になる。中の `- ` の行は箇条書きに、```` ``` ```` の行はフェンスの開きになる。評価用の issue245 では十数か所が当たる）・Setext の見出し・行頭に `|` の無い表・YAML の front matter。箇条書きの記号を重ねた行（`- - ```go`・`- > ```go`）で開いたフェンスは開きと見ず、字下げした閉じの行が開きになって、内と外が文書の終わりまで逆になる（記号を1行に1つだけ書けば避けられる）。引用や箇条書きの中で閉じないフェンスは、描画と違って文書の終わりまで `code_line` になる（continuo の docs/plans の46本では0件）。
 - 根拠付け（15節）: 候補を80件で切るときは遠い単位から落ちるので、大きな H2 の塊では「冒頭の節」と「識別子の共有」の候補から先に落ちる。字数は `instructions` と `input` で測るので、`out_path`・差し戻しの理由（3回で、日本語の理由なら約1,300字、`"` や `\` が多い理由では JSON のエスケープで約2,000字。issue134 の写しで測った）は40,000字の外にある。1回で読めた44,333字の内に収まる見込みだが、決定1件と指示文だけで40,000字を超えるジョブは Read で途中までしか読まれず、読んだ範囲で検証を通る答えが返りうる（continuo の4本では0件）。追加を全部削っても40,000字を超える決定は r2 を作らず、need の残った r1 の答えが残る。単位は見出しの段を持たないので、H2 の塊は `sec` と `path` から推す。H1 と同じ題名の H2・H2 と同じ題名の H4・H3 の下の引用の `## ` では、区切りが実際の見出しとずれる（continuo の docs 140本では0件）。長いプランでは1回の起動で Agent を100回以上呼び、メインのセッションの文脈が持つかは確かめていない。束とジョブの大きさは仮の値で、#9 で測り直す。
 - 輪を断つ反復と結合（16節）: 大きな成分のジョブに字数の上限が無く、40,000字を超えると Read で途中までしか読まれず失敗しうる（issue224 の最大は23ノード。#9 で測る）。冒頭の節か、H2 が1つしかないか無いプランで分類のジョブが1件失敗すると、ほぼ全部の決定が影響を受けうる決定になり（悲観でも根に届く決定のほかは unverified）、その周の fixes はほぼ空になる（失敗したジョブは次の周で出し直される）。楽観でも根に届かない決定は「いまの答えのままでは届かない」の意味で、失敗が解けると輪を断つ段を通じて答えが変わりうる。2-gram の追加で失敗した単位に届いたかは見ない。輪を断つ段が失敗した成分は、この周では輪を断ち直さない。記憶の鍵は単位の原文とノードの言い換えだけで見出しを入れないので、節が違っても原文と言い換えが同じ決定は、切った辺の記憶を共有する（to の側でも from の側でも）。前の周に切った辺の記憶が消えると（`cache/` を空にしたときを含む）、その辺は戻りうる。いまの周の段を作る前に消えれば、輪が戻れば輪を断ち直す。作ったあとに消え、作り直した輪や後の回の入力が変われば `next`・`verify`・`report`・`show` が 1 で終わる。相手の決定が自分の記憶で外れたままなら輪にならず、どちらでも見つけない（突き合わせる痕跡が残らない）。輪を断つジョブの status を done から failed に書き換えると、その成分の決定は F_dec に入り、後の回の輪を断つ段の対象から外れる。後の回の輪を断つジョブが既に作られていて、その決定を含むなら、作り直した入力が作られたジョブと食い違うので、`next`・`verify`・`report`・`show` は 1 で終わる。作られる前なら、その輪は断たれず、反復が早く終わりうる（K が縮む）。終わった回 K の輪と重なれば、その決定は U に入る（悲観でも根に届かない決定は unverified、届く決定は rooted のまま。どちらも fixes と questions から外れる。楽観は U を rooted に固定するので、U の決定を理由にした U の外の決定も unverified になりうり、周の途中で1つ書き換えただけで fixes が0件になることがある）。反論の段が作られたあとなら、反論のジョブのある決定が対象から外れて、`next`・`report`・`show` が 1 で終わりうる（`verify` は反論の段を見ない）。どれにも当たらなければ見つけず、`failed_jobs` だけが増える（test_decycle.py の4つの流れで確かめた）。周の途中で記憶が壊れると `next` が 1 で終わり、`init` から回し直せば壊れた記憶は無いものとして進む。
+- キャッシュの有無（16節の記憶）: 切った辺の記憶も `cache/` にあるので、キャッシュを残した周は前の周に切った辺を回1から候補から外し（両端の文が同じ限り、プランを直して輪がほどけても外し続ける）、`cache/` を空にした周は外さずに根拠付けして輪を断ち直す。そのため結果が変わることがある。test_cache.py の限界のテストで押さえた例は2つで、どちらも別の issue で直す対象のいまの振る舞い。(1) 輪をほどいた周: test_decycle.py の `PLAN` で決定A⇄決定B の輪を決定B→決定A で切ったあと、書き手が決定B の別の理由（前提の1行）を足すと、キャッシュありだけ決定A が決定B を外したまま gap を持つ（測った答え（gap は fact・反論は無し）では、ありが fixes=1・`NEXT: continue`、なしが fixes=0・`NEXT: show`。gap が fixes に出るか questions に出るか、NEXT が分かれるかは答えで変わる）。(2) 回6で輪が残る周: 7つの決定の輪（`RING_PLAN`）は1周目に fixes=6 で、同じプランの2周目はキャッシュありが残った輪をもう一度断って fixes=1（輪を断つジョブ1・根拠付け1）、なしが fixes=6（どちらも `NEXT: show`）。一致を確かめる test_cache.py の一致のテストは、足す1行が一部の決定からだけ離れたプランで、輪を断ち直す側も同じ辺を切る場合である。
 - 反論（17節）: 根拠にした前提が本当に反論を退けているか（同じ前提で言い直しただけか）は確かめない（意味の判断で、反証の正しさの保証は後の段階。P8。[../idea.md:72](../idea.md#L72)）。ほかの決定や推論を経た反証と、候補の外の前提でしか退けられない反論は refuted にできず、accepted か needs_human として残る（安全側）。反論のジョブには字数の上限が無く、入力は1決定の答えと根拠付けの候補の前提で、根拠付けのジョブより大きくなりうる（見積もりで約1.3倍）。40,000字を超えると Read で途中までしか読まれうる（#9 で測る）。反論のジョブの status を done から failed に書き換えると、その決定の accepted が fixes から消える（網羅はジョブの status を先に見る）。
 - report と show（18〜21節）: 本文が同じ質問だけをまとめるので、言い換えの違う同じ問いは別の項目に残る（#9 で数える）。決まり3は両方の起動で確かめない（8節）。rounds.jsonl と写しは `Edit(**/.pace/**)` で書き換えられるので、書き手は周を数え直させることも、見せていない版を基準に入れることもできる（`*.out.json` を書けるのと同じ型）。「初回」は shown.md の sha256 で、周の数は shown の行の位置で決めるので、shown.md を消して init し直すと、show.md は初回と出すのに、周は前の shown の行から数える。毎回失敗するジョブがあると、書き手が直さないまま上限の3周まで回る。プランのディレクトリが無いと、errors の `show` は書けずに 1 で終わる。
 - H2 が1つしかないプラン（continuo の計画のコメントなど）では、「同じ H2」の候補の規則がプラン全体を指す（[../idea.md:694-696](../idea.md#L694-L696)）。「冒頭の節」の規則は、目標を冒頭に書く書き方を前提にしている（[../idea.md:704](../idea.md#L704)）。
@@ -423,6 +424,8 @@ WAVE bundles=1 jobs=1
 | ジョブは回 k ごとに `jobs/link_r1_<k>/`・`jobs/link_r2_<k>/` の `link_r1_<k>_<決定>_<周の印>`（16節）。版・指示文・agent・鍵の段の名前は `link` | 同じ周で r1 と r2 を、回ごとに別の段として作り終えた印を持つ |
 | 根拠付けのジョブは1件40,000字まで、束は120,000字・20ジョブまで（分類と裁定は60,000字のまま） | ジョブ: Read は1回25,000トークンまでで、候補の形の JSON は約0.57トークン/字だった（短い形の44,333字・2,098行は1回で読め、53,526字は30,347トークンで切れた）。束: 60,000字では長いプランで1束2件前後になる。120,000字が200k の文脈に収まるかは推論で、#9 で測り直す |
 
+- **やり直す決定の例（テストで押さえるもの）。**どの決定が根拠付けし直しになるかは、表の候補の行（同じ H2 の塊・前後5単位・冒頭の節・識別子の共有）で候補が変わった決定と、表の「やり直すのは入力が変わった決定だけ」の行のとおりで、規則は足さない。(1) test_report.py の `edit(1)`: test_decycle.py の `PLAN`（全部の単位が1つの H2 の中にあり、その H2 が冒頭の節でもある。決定3つ）の末尾に1行足すと、3つの決定が全部やり直しになる（`link_r1_1` 3件）。(2) test_cache.py の一致のテスト: 決定A・B・C から前後5単位の外で、冒頭の節でも同じ H2 でもない別の H2 に1行足すと、その H2 の決定D だけがやり直しになる（`link_r1_1` 1件）。(3) test_link.py の `test_editing_a_unit_relinks_only_dependent_decisions`: 単位を直すと、直した単位そのものの決定と、それを候補に含む決定だけがやり直しになり、候補に含まない遠くの決定は出ない。周ごとにやり直したジョブの数は rounds.jsonl の `jobs` に残る（19節）。
+
 **確かめた結果（2026-10-17、Claude Code 2.1.302、herdr の pane、`--permission-mode manual`、user settings を読む起動（Bash・Edit・Write・Agent を許す規則は無い）、確かめ用のディレクトリの settings に README の2つの規則）。**continuo `03a5fa3f` の issue224_config_reload.md（89単位）の写しで `DONE decisions=47 premises=33 failed_jobs=0`（約9分、確認なし）。根拠付けは r1 が47ジョブ（最大11,094字・平均8,777字）を4束、r2 が28ジョブ（最大15,390字・平均11,923字）を3束で、差し戻し0件。候補は平均27ノード・最大34ノード、r2 の追加は平均7.9件で、28件のうち10件が足した候補を step に使った。根拠付けの呼び出しの文脈は最大約105k トークン（sonnet）。長いプランは回していない（[#9](https://github.com/maimuzo/pace/issues/9) で測る）。
 
 **退けた案。**
@@ -510,7 +513,7 @@ GAP G_D_1a2b3c4d_1_g1 value leverage=2
 - 項目には、その gap を持つ決定（まとめた質問では全部）の原文と、questions ではその決定の分類の段で出た別案を添える。止めている決定（`leverage_sets`）は数だけ書く。
 - **プランの sha256 は、`Round` が init の写しと同じと確かめたバイト**から取る。
 - **同じ周（同じ周の印）の2回目**は rounds.jsonl に行を足さず、3つのファイルを書き直し、標準出力の2行は記録した値を出す。計算し直した件数が記録と違えば（間にジョブの status が書き換えられた）、report.md にそう書く（fixes.md・questions.md の題の件数と show.md の PACE-STATUS は計算し直した値のままで、記録の値と食い違う）。
-- **順1は版を見ない。**rounds.jsonl の行はプランの sha256 だけを持つので、plugin を更新したり `cache/` を空にしたりした直後の最初の周も、前の周とプランが同じなら `NEXT: show` になる（答えが変わりうるのに、書き手が直さないまま見せる）。見せたあとの最初の周は比べないので、`shown` を打ってから更新すれば当たらない。周の途中（`init` の前）で plugin を更新すると、更新の前に出したジョブの答えが新しい鍵のキャッシュに入りうる（ジョブの指示文と段の版をいまの値と比べない。#4 からある形。SKILL.md はどの起動も `init` から始めるので、ふつうの道では起きない）。
+- **順1は版を見ない。**rounds.jsonl の行はプランの sha256 だけを持つので、plugin を更新したり `cache/` を空にしたりした直後の最初の周も、前の周とプランが同じなら `NEXT: show` になる（答えが変わりうるのに、書き手が直さないまま見せる）。見せたあとの最初の周は比べないので、`shown` を打ってから更新すれば当たらない。周の途中（`init` の前）で plugin を更新すると、更新の前に出したジョブの答えが新しい鍵のキャッシュに入りうる（ジョブの指示文と段の版をいまの値と比べない。#4 からある形。SKILL.md はどの起動も `init` から始めるので、ふつうの道では起きない）。切った辺の記憶があるので、`cache/` を空にした周はキャッシュを残した周と結果が変わることもある（[限界](#10-限界)）。
 - rounds.jsonl は、読めた行に新しい行を足した全体を `write_atomic` で書く。読めない行と形の違う行は読み飛ばし（そのときに落ちる）、ふつうのファイルとして読めなければ空とみなす（init は残すので、打ち直しでは直らない。`cache/` と同じ）。
 
 ---
@@ -520,12 +523,13 @@ GAP G_D_1a2b3c4d_1_g1 value leverage=2
 **言いたいこと。**rounds.jsonl は report の行と shown の行を持ち、「最後に見せてから何周か」と「初回」の判定に使う。見本どうしは別の状態の例で、件数を揃えない。
 
 ```json
-{"kind": "report", "round": 4, "run": "7f3a9c21", "plan_sha256": "9f2c…", "units": 96, "decisions": 50, "rooted": 2, "needs_gap": 48, "ungrounded": 0, "unverified": 0, "gaps": {"fact": 9, "requirement": 2, "value": 4}, "defeaters": {"accepted": 5, "refuted": 6, "needs_human": 2}, "failed_jobs": 0, "fixes": 14, "questions": 8, "since_shown": 2, "next": "continue"}
+{"kind": "report", "round": 4, "run": "7f3a9c21", "plan_sha256": "9f2c…", "units": 96, "decisions": 50, "rooted": 2, "needs_gap": 48, "ungrounded": 0, "unverified": 0, "gaps": {"fact": 9, "requirement": 2, "value": 4}, "defeaters": {"accepted": 5, "refuted": 6, "needs_human": 2}, "failed_jobs": 0, "fixes": 14, "questions": 8, "since_shown": 2, "jobs": {"classify": 2, "adjudicate": 0, "link": 3, "decycle": 0, "review": 2}, "next": "continue"}
 {"kind": "shown", "after_round": 5, "snapshot_sha256": "1b7e…"}
 ```
 
 - 「最後に見せてから何周か」（`since_shown`）は、最後の shown の行より後ろの report の行の数に、この周の1を足したもの。「初回」は、shown の行が無いか、最後の shown の行の `snapshot_sha256` がいまの `shown.md` の sha256 と合わないこと（`shown.md` だけが消えて init が作り直した基準も初回と出る）。
 - `round` は report の行の通し番号、`gaps` は全部の gap の数（数えた項目ではない。idea.md 7.2 と比べるため）、`after_round` は最後の report の行の `round`（無ければ0。判定には使わない）。
+- `jobs` は、その周に作って AI に出したジョブの数を段の種類（`classify`・`adjudicate`・`link`（`link_r1_k`・`link_r2_k` の全部の回）・`decycle`（全部の回）・`review`）ごとに足したもの（周を重ねる費用を #9 で測るため）。いまの周の印の `jobs/<段>/created.json` の列の長さで数え、作られていない段（0件の `decycle_k` より後の回）は0件。分類・裁定・根拠付け・反論はキャッシュに当たらなかったものだけがジョブになるが、輪を断つ段はキャッシュに当たってもジョブを作る（5節）ので数に入る。差し戻しで出し直した回数（`attempts`）は数えない。report.md には出さない。`read_rounds` は `jobs` を確かめないので、`jobs` の無い前の版の行も読み、周の数えに入れる。report を打たずに `init` し直した周のジョブは数えられない（`init` が `jobs/` を消し、次の `next` が新しい周の印を作るため）。
 
 ````markdown
 # 人間への質問: issue224_config_reload.md（2件）

@@ -2905,6 +2905,12 @@ def report_(plan_arg):
                 nxt = "continue"
             a = f["analysis"]
             gaps = {p: sum(1 for g in a["gaps"] if g["ptype"] == p) for p in PTYPES}
+            # この周に作って AI に出したジョブの数（段の種類ごと）。キャッシュに当たらなかったものだけが作られるが、
+            # 輪を断つ段はキャッシュに当たってもジョブを作るので数に入る。作られていない段（0件の decycle_k より
+            # 後の回）は0件。差し戻しで出し直した回数は数えない（19節）
+            jobs = {"classify": 0, "adjudicate": 0, "link": 0, "decycle": 0, REVIEW_STAGE: 0}
+            for stage in JOB_STAGES + (REVIEW_STAGE,):
+                jobs[stage_kind(stage)] += len(rnd.created(stage, rid) or [])
             record = {"kind": "report", "round": max((x["round"] for x in rounds if x["kind"] == "report"), default=0) + 1,
                       "run": rid, "plan_sha256": sha, "units": len(rnd.units), "decisions": len(a["decisions"]),
                       "rooted": sum(1 for s in a["status"].values() if s == "rooted"),
@@ -2912,7 +2918,7 @@ def report_(plan_arg):
                       "ungrounded": sum(1 for s in a["status"].values() if s == "ungrounded"),
                       "unverified": sum(1 for s in a["status"].values() if s == "unverified"),
                       "gaps": gaps, "defeaters": f["defeaters"], "failed_jobs": failed, "fixes": fixes,
-                      "questions": questions, "since_shown": since_shown, "next": nxt}
+                      "questions": questions, "since_shown": since_shown, "jobs": jobs, "next": nxt}
             rounds.append(record)
         status = status_line(record["failed_jobs"], record["fixes"], record["questions"])
         w = Writer(rnd, f)

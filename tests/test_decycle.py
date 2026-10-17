@@ -31,6 +31,9 @@ PLAN = """# 題
 # 根拠付けで、決定（原文）ごとに理由にする候補の原文。A と B は互いを理由にし合う（輪）。C は前提から根に届く
 SUPPORT = {"決定Aを選ぶ。": ["決定Bを選ぶ。"], "決定Bを選ぶ。": ["決定Aを選ぶ。"], "決定Cを選ぶ。": ["前提の文。"]}
 
+# 7つの決定の輪（ring_link・cut_first で回すと、輪を断つ段を5回回しても輪が残る）。test_cache.py も使う
+RING_PLAN = "# 題\n\n## 設計\n\n" + "".join("決定%dを選ぶ。\n" % i for i in range(1, 8))
+
 
 def run(*args):
     return subprocess.run([sys.executable, str(PACE), *args], capture_output=True, text=True)
@@ -587,7 +590,7 @@ class OtherPlanFlowTest(FlowBase):
         self.init()
 
     def test_ring_runs_to_pass_six_and_leaves_a_cycle(self):
-        self.use("# 題\n\n## 設計\n\n" + "".join("決定%dを選ぶ。\n" % i for i in range(1, 8)))
+        self.use(RING_PLAN)
         last, _ = self.drive(link=ring_link, decycle=cut_first, limit=40)
         self.assertEqual(last, "DONE decisions=7 premises=2 failed_jobs=0")
         for k in range(1, 6):

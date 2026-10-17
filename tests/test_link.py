@@ -220,6 +220,9 @@ class CandidateTest(unittest.TestCase):
         nodes[0] = target
         inp = pace.select_candidates(units, nodes, target)
         size = pace.link_size(inp)
+        # 字数は指示文と入力だけを、ジョブファイルと同じ形（日本語をそのまま・indent=1）で測った長さ
+        self.assertEqual(size, len(json.dumps({"instructions": pace.INSTRUCTIONS["link"], "input": inp},
+                                              ensure_ascii=False, indent=1) + "\n"))
         self.assertLessEqual(size, pace.LINK_JOB_MAX_CHARS)
         # 削ったあとの余白より大きい out_path と理由を足すと、ジョブ全体は上限を超える
         room = pace.LINK_JOB_MAX_CHARS - size
@@ -601,6 +604,36 @@ class LinkFlowTest(unittest.TestCase):
         first, _ = self.drive()
         self.init()
         self.assertEqual(self.next().stdout.strip(), first)
+
+    def test_broken_link_cache_is_rebuilt(self):
+        """根拠付けのキャッシュは読むたびにいまの入力で検証し直す（cache_get が check_link を通す）。壊れた答えは
+        無いものとして、その決定だけジョブを作り直し、答えると検証を通る答えで書き戻す。"""
+        self.init()
+        self.drive()
+        rnd = pace.Round(str(self.plan), readonly=True)
+        ids = [d["id"] for d in rnd.decisions()]
+        self.assertEqual(len(ids), 2)
+        # 決定1は答えが JSON のオブジェクトでない。決定2は target へ届く正しい step のほかに、from は候補のノードで
+        # 正しいが to が target でも自分の claim でもない step を持つ（to の確かめだけで落ちる）
+        node = rnd.link_input("link_r1_1", ids[1])["candidates"][0]["nodes"][0]["id"]
+        broken = [(ids[0], {"answer": 5}),
+                  (ids[1], {"answer": {"claims": [], "gaps": [], "need": [],
+                                       "steps": [{"from": [node], "to": ids[1], "warrant": "理由"},
+                                                 {"from": [node], "to": "c9", "warrant": "理由"}]}})]
+        for victim, bad in broken:
+            link_input = rnd.link_input("link_r1_1", victim)
+            path = self.work / "cache" / (rnd.link_key(link_input) + ".json")
+            self.assertTrue(path.exists())
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            self.init()
+            bundles, _ = parse(self.next().stdout)
+            jobs = [json.loads(Path(p).read_text(encoding="utf-8")) for _, _, ps in bundles for p in ps]
+            # 壊した決定の link_r1_1 だけが出る（もう1つの決定はキャッシュに当たる）
+            self.assertEqual([(j["stage"], j["input"]["target"]["id"]) for j in jobs], [("link_r1_1", victim)])
+            self.answer(bundles)
+            last, _ = self.drive()
+            self.assertTrue(last.startswith("DONE decisions=2"))
+            self.assertIsNotNone(rnd.cache_get(rnd.link_key(link_input), link_input))
 
     def test_editing_a_unit_relinks_only_dependent_decisions(self):
         far = "遠くの読み直しの理由を書く。"
