@@ -2019,7 +2019,8 @@ class Round:
         （列の比べか load_job で）見つかる。done を failed に書き換えると、その成分の決定は F_dec に入って後の回の輪を
         断つ段の対象から外れる。後の回の輪を断つジョブが既に作られていて、その決定を含むなら、列の比べか load_job で
         見つかる。作られる前なら反復が早く終わりうり、終わった回 K の輪と重なれば決定は U に入る。どれにも当たらなければ
-        見つけず、failed_jobs だけが増える（突き合わせる痕跡が残らない。10節）。
+        見つけず、failed_jobs だけが増える（突き合わせる痕跡が残らない。10節）。反論の段が作られたあとなら、反論のジョブの
+        ある決定が対象から外れて、next・report・show が 1 で終わりうる（verify は反論の段を見ない）。
         """
         stage = "decycle_%d" % k
         want = ["%s_%03d_%s" % (stage, i, rid) for i in range(1, len(self.decycle_components(k)) + 1)]
@@ -2257,7 +2258,8 @@ class Round:
         項目は gap 1つ（questions の gap だけ、ptype と normalize した本文が同じものを1つにまとめる）・accepted か
         needs_human の反論1つ・残った輪1つ・根拠の無い決定1つ。U の決定は、悲観でも根に届いて rooted でも、その gap と
         反論を数えず「確かめられなかったもの」に出す（性質3。U の集合と計算は #6 のまま）。U の外で unverified の決定
-        （U の決定を理由にしたもの）も、同じく gap と輪を数えずにそこへ出す（その gap は verify で uncertain）。refuted は数えない（根拠は前提に
+        （楽観で rooted・悲観で届かない。U の決定に頼ってだけ根に届くもの）も、同じく gap と輪を数えずにそこへ出す
+        （その gap は verify で uncertain）。外した輪の ungrounded の決定は、根拠の無い決定として数える。refuted は数えない（根拠は前提に
         限るので必ず根に届く）。
         """
         rid = self.round_id()
@@ -2307,7 +2309,8 @@ class Round:
         cycles = [{"kind": "cycle", "decisions": list(c),
                    "edges": [(f, t, w) for (f, t), w in sorted(edges.items(), key=lambda e: (order[e[0][0]], order[e[0][1]]))
                              if f in c and t in c]} for c in a["cycles"] if not set(c) & unsure]
-        in_cycle = {d for c in a["cycles"] for d in c}
+        # 外した輪の ungrounded の決定は、楽観でも届かない（失敗に依らない）ので、根拠の無い決定として残す
+        in_cycle = {d for c in cycles for d in c["decisions"]}
         ungrounded = [{"kind": "ungrounded", "decision": d} for d in ids
                       if status[d] == "ungrounded" and d not in in_cycle and d not in unsure]
         fixes = sorted(fact_gaps, key=by_weight) + accepted + cycles + ungrounded
@@ -2595,9 +2598,8 @@ class Round:
         if review_ids is None:
             review_ids = self.write_stage(REVIEW_STAGE, rid, self.make_review(rid))
         pending = []
-        targets = self.review_targets()
         for job_id in review_ids:
-            job = self.load_review_job(job_id, targets)
+            job = self.load_job(REVIEW_STAGE, job_id)
             if job.get("status") == "pending":
                 pending.append(job)
             elif job.get("status") == "issued":

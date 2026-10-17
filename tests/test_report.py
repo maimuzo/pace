@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "pace" / "scripts"))
 import pace  # noqa: E402
-from test_decycle import FlowBase, PLAN, link_for, parse, run  # noqa: E402
+from test_decycle import FlowBase, PLAN, cut_first, link_for, parse, ring_link, run  # noqa: E402
 
 
 def accept_b(job):
@@ -38,12 +38,41 @@ def u_link(job):
     return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "%sの穴" % name}], "need": [], "steps": steps}
 
 
+def order_link(job):
+    """A は前提から根に届き requirement の gap も持つ（止めている決定 0件）。B は value の gap だけで止まり（B と C の2件）、
+    C は B を理由にする（gap 無し・local なので反論にかける）。A と B の gap は本文が同じで ptype が違う。"""
+    target = job["input"]["target"]
+    ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+    gap = lambda ptype: [{"id": "g1", "ptype": ptype, "text": "同じ文"}]
+    step = lambda f: {"from": f, "to": target["id"], "warrant": "理由"}
+    if target["plan_text"] == "決定Aを選ぶ。":
+        return {"claims": [], "gaps": gap("requirement"), "need": [], "steps": [step([ids["前提の文。"]]), step(["g1"])]}
+    if target["plan_text"] == "決定Bを選ぶ。":
+        return {"claims": [], "gaps": gap("value"), "need": [], "steps": [step(["g1"])]}
+    return {"claims": [], "gaps": [], "need": [], "steps": [step([ids["決定Bを選ぶ。"]])]}
+
+
+def human_and_refuted(job):
+    """needs_human と、入力の前提を根拠にした refuted を1つずつ出す。"""
+    premise = next(n["id"] for n in job["input"]["nodes"] if n["plan_text"] == "前提の文。")
+    t = job["input"]["target"]["id"]
+    return {"defeaters": [{"target": t, "type": "value", "text": "人間に訊く", "status": "needs_human", "by": []},
+                          {"target": t, "type": "fact", "text": "退けた", "status": "refuted", "by": [premise]}]}
+
+
 class FormTest(unittest.TestCase):
     def test_fence_is_longer_than_inner_backticks(self):
         self.assertEqual(pace.fence("a ``` b", "text", "  "), ["  ````text", "  a ``` b", "  ````"])
         self.assertEqual(pace.fence("a", "diff", ""), ["```diff", "a", "```"])
         # 行末の空白は残し（空白だけを変えた差分が見える）、空の行には字下げを付けない
         self.assertEqual(pace.fence("-a \n\n+a", "diff", "  "), ["  ```diff", "  -a ", "", "  +a", "  ```"])
+
+    def test_sub_list_follows_the_number_width(self):
+        w = pace.Writer.__new__(pace.Writer)
+        w.nodes = {"D_1": {"line": 3}}
+        w.unit_text = lambda d: "決定。"
+        self.assertEqual(w.item(9, {"kind": "ungrounded", "decision": "D_1"})[1], "   ```text")
+        self.assertEqual(w.item(10, {"kind": "ungrounded", "decision": "D_1"})[1], "    ```text")
 
     def test_inline(self):
         self.assertEqual(pace.inline("a\nb\r\nc"), "`a b c`")
@@ -214,6 +243,58 @@ class ReportFlowTest(FlowBase):
         self.assertIn("失敗の影響を受けうる決定（行7）", show)
         self.assertIn("失敗の影響を受けうる決定を理由にした決定（unverified）（行8）", show)
 
+    def test_questions_order_merge_and_defeaters(self):
+        """questions は止めている決定の多い順で、ptype が違えば本文が同じでもまとめない。needs_human は questions の後ろ、
+        refuted はどちらにも入らない。"""
+        self.init()
+        for _ in range(30):
+            bundles, last = parse(self.next().stdout)
+            if last.startswith("DONE"):
+                break
+            self.answer(bundles, link=order_link, review=human_and_refuted)
+        r = self.report()
+        self.assertEqual(r.stdout.splitlines()[-2], "PACE-STATUS: errors=0 failed_jobs=0 fixes=0 questions=3")
+        q = (self.work / "questions.md").read_text(encoding="utf-8")
+        heads = [x for x in q.splitlines() if x[:1].isdigit()]
+        self.assertEqual(heads, ["1. 価値判断: `同じ文`（止めている決定 2件）", "2. 要求: `同じ文`（止めている決定 0件）",
+                                 "3. 反論（needs_human。value）: `人間に訊く`"])
+        self.assertNotIn("退けた", (self.work / "fixes.md").read_text(encoding="utf-8"))
+        self.assertIn("| refuted | `退けた` |", (self.work / "report.md").read_text(encoding="utf-8"))
+
+    def test_left_cycle_and_ungrounded_are_fixes(self):
+        """回6まで回して残った輪は fixes の1項目で、輪の外の ungrounded の決定はそれぞれ1項目。輪の中の決定は ungrounded に
+        重ねない。輪に unverified の決定が入れば輪は外し、その相手の ungrounded の決定は根拠の無い決定として残す。"""
+        self.plan.write_text("# 題\n\n## 設計\n\n" + "".join("決定%dを選ぶ。\n" % i for i in range(1, 8)), encoding="utf-8")
+        self.init()
+        for _ in range(40):
+            bundles, last = parse(self.next().stdout)
+            if last.startswith("DONE"):
+                break
+            self.answer(bundles, link=ring_link, decycle=cut_first)
+        rnd = pace.Round(str(self.plan), readonly=True)
+        f = rnd.findings()
+        cycles = [x for x in f["fixes"] if x["kind"] == "cycle"]
+        self.assertEqual(len(cycles), 1)
+        ring = cycles[0]["decisions"]
+        ungrounded = [x["decision"] for x in f["fixes"] if x["kind"] == "ungrounded"]
+        self.assertEqual(len(ungrounded), 5)
+        self.assertFalse(set(ring) & set(ungrounded))
+        self.report()
+        self.assertIn("残った輪（決定 2件", (self.work / "fixes.md").read_text(encoding="utf-8"))
+        rnd = pace.Round(str(self.plan), readonly=True)
+        targets = rnd.review_targets()
+        rnd.review_targets = lambda: targets  # 反論の段はもとの状態で済んでいる
+        analyze = rnd.analyze
+
+        def one_unverified(k=None):
+            a = analyze(k)
+            return dict(a, status=dict(a["status"], **{ring[0]: "unverified"}))
+        rnd.analyze = one_unverified
+        f = rnd.findings()
+        self.assertFalse([x for x in f["fixes"] if x["kind"] == "cycle"])
+        self.assertIn(ring[1], [x["decision"] for x in f["fixes"] if x["kind"] == "ungrounded"])
+        self.assertEqual(f["unverified"], [ring[0]])
+
     def test_failed_classify_units_are_listed(self):
         self.plan.write_text("# 題\n\n## 設計\n\n前提の文。\n決定Aを選ぶ。\n\n## 別\n\n別の前提の文。\n", encoding="utf-8")
         self.init()
@@ -289,6 +370,9 @@ class ReportFlowTest(FlowBase):
         self.assertNotIn("初回", show)
         self.assertIn("+追記1の前提。", show)
         self.assertIn("```diff", show)
+        # 前後1行の文脈だけを載せる
+        diff = show.split("```diff\n", 1)[1].split("\n```", 1)[0].splitlines()
+        self.assertEqual([x for x in diff if x.startswith(" ")], [" 決定Cを選ぶ。", " "])  # 後ろは末尾の改行の後の空の行
 
     def test_shown_rejects_and_changes_nothing(self):
         self.round_()
