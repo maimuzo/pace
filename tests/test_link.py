@@ -212,12 +212,25 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(kept, [u["text"] for u in units if u["kind"] == "sentence"][1:len(kept) + 1])
 
     def test_size_ignores_paths_and_errors(self):
-        """字数は指示文と入力だけで測る。ジョブファイルに足す out_path・差し戻しの理由を変えても同じ。"""
-        inp = pace.select_candidates(self.units, self.nodes, self.target)
-        short = {"instructions": pace.INSTRUCTIONS["link"], "input": inp, "out_path": "/a"}
-        long_ = dict(short, out_path="/" + "x" * 5000, previous_errors=["理由" * 150] * 3, attempts=3)
-        self.assertNotEqual(len(pace.dumps(short)), len(pace.dumps(long_)))
-        self.assertEqual(pace.link_size(inp), len(pace.dumps({"instructions": pace.INSTRUCTIONS["link"], "input": inp})))
+        """削る判定は指示文と入力だけで測る。out_path と差し戻しの理由を足したジョブ全体が上限を超えても、候補は削らない。"""
+        body = "".join("文%d%s。\n" % (i, "長" * 3000) for i in range(30))
+        units = units_of("# 題\n\n## 節\n\n" + body)
+        nodes = nodes_for(units, lambda u: [premise("前提")] if u["kind"] == "sentence" else [])
+        target = dict(nodes[0], kind="decision", alternatives=["別"])
+        nodes[0] = target
+        inp = pace.select_candidates(units, nodes, target)
+        size = pace.link_size(inp)
+        self.assertLessEqual(size, pace.LINK_JOB_MAX_CHARS)
+        # 削ったあとの余白より大きい out_path と理由を足すと、ジョブ全体は上限を超える
+        room = pace.LINK_JOB_MAX_CHARS - size
+        job = {"instructions": pace.INSTRUCTIONS["link"], "input": inp, "out_path": "/" + "x" * (room + 10),
+               "previous_errors": ["理由" * 150] * 3, "attempts": 3}
+        self.assertGreater(len(pace.dumps(job)), pace.LINK_JOB_MAX_CHARS)
+        # ジョブ全体で測って削っていたら、もっと少ない候補になっていた（実際は削らずに残っている）
+        whole = dict(inp, candidates=list(inp["candidates"]))
+        while whole["candidates"] and len(pace.dumps(dict(job, input=whole))) > pace.LINK_JOB_MAX_CHARS:
+            whole["candidates"].pop()
+        self.assertLess(len(whole["candidates"]), len(inp["candidates"]))
 
     def test_link_bundle_limits(self):
         self.assertEqual(pace.bundle_limits("link_r1"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
@@ -232,6 +245,7 @@ class CandidateTest(unittest.TestCase):
         gone = self.by_text["監視は使わない。"]["id"]
         nodes = [n for n in self.nodes if n["unit"] != gone]
         self.assertNotIn("監視は使わない。", candidate_texts(pace.select_candidates(self.units, nodes, self.target)))
+        # Round の経路（分類が失敗した単位を nodes() が外す）は LinkFlowTest.test_failed_classify_units_are_not_candidates
 
     def test_empty_backticks_are_not_identifiers(self):
         self.assertEqual(pace.identifiers("a ` ` b `x` c"), {"x"})
@@ -280,6 +294,35 @@ class ExpandTest(unittest.TestCase):
         self.assertEqual(texts[0], "理由の文0。")
 
 
+class ExpandTrimTest(unittest.TestCase):
+    """r2 の40,000字での削り（import して確かめる）。"""
+
+    def build(self, far_len):
+        near = "".join("近%d。\n" % i for i in range(3))
+        far = "".join("理由の文%d%s。\n" % (i, "長" * far_len) for i in range(12))
+        units = units_of("# 題\n\n## 一\n\n決める。\n" + near + "\n" + "".join(
+            "## 節%d\n\n埋め%d。\n\n" % (i, i) for i in range(8)) + "## 遠く\n\n" + far)
+        nodes = nodes_for(units, lambda u: [decision(u["text"])] if u["text"] == "決める。" else [premise(u["text"])])
+        target = next(n for n in nodes if n["kind"] == "decision")
+        r1 = pace.select_candidates(units, nodes, target)
+        return units, nodes, target, r1
+
+    def test_trims_lowest_similarity_first(self):
+        units, nodes, target, r1 = self.build(3000)
+        need = {"claims": [], "gaps": [], "steps": [], "need": ["理由の文1", "理由の文"]}
+        full = pace.expand_candidates(units, nodes, target, r1, need)
+        self.assertIsNotNone(full)
+        self.assertLessEqual(pace.link_size(full), pace.LINK_JOB_MAX_CHARS)
+        self.assertLess(len(full["added"]), pace.EXPAND_MAX)  # 字数で削った
+        texts = [next(n["text"] for n in nodes if n["id"] == i) for i in full["added"]]
+        self.assertTrue(texts[0].startswith("理由の文1"))  # いちばん近いものは残る
+
+    def test_all_trimmed_gives_none(self):
+        units, nodes, target, r1 = self.build(pace.LINK_JOB_MAX_CHARS)
+        need = {"claims": [], "gaps": [], "steps": [], "need": ["理由の文"]}
+        self.assertIsNone(pace.expand_candidates(units, nodes, target, r1, need))
+
+
 class CheckLinkTest(unittest.TestCase):
     """根拠付けの答えの検証（import して確かめる）。"""
 
@@ -318,6 +361,9 @@ class CheckLinkTest(unittest.TestCase):
         self.bad(self.ok(steps=[{"from": ["P_a_1"], "to": "D_x_1", "warrant": "w"}]), "gap")
         self.bad(self.ok(steps=[{"from": ["P_a_1", "g1"], "to": "D_x_1", "warrant": " "}]), "warrant")
         self.bad(self.ok(claims=[{"id": "x1", "text": "主張"}]), "c<数>")
+        self.bad(self.ok(gaps=[{"id": "c9", "ptype": "value", "text": "穴"}]), "g<数>")
+        self.bad(self.ok(gaps=[{"id": "g1", "ptype": "value", "text": "穴"}, {"id": "g1", "ptype": "fact", "text": "穴2"}]),
+                 "2回")
         self.bad(self.ok(gaps=[{"id": "g1", "ptype": "zzz", "text": "穴"}]), "ptype")
         self.bad(self.ok(claims=[{"id": "c1", "text": "a"}, {"id": "c1", "text": "b"}]), "2回")
         self.bad(self.ok(need=["\ud83d"]), "need")
@@ -522,6 +568,34 @@ class LinkFlowTest(unittest.TestCase):
                                             ensure_ascii=False, sort_keys=True) for q in paths))
         self.assertEqual(inputs[0], inputs[1])
 
+    def test_failed_classify_units_are_not_candidates(self):
+        """分類の A のジョブが失敗した節の単位は、ノードが無いので根拠付けの候補に入らない（Round の経路）。"""
+        self.init()
+        goal = "読み直しの漏れを無くす。"
+        skipped = set()
+        for _ in range(12):
+            bundles, last = parse(self.next().stdout)
+            if last.startswith("DONE"):
+                break
+            keep = []
+            for b in bundles:
+                paths = []
+                for q in b[2]:
+                    job = json.loads(Path(q).read_text(encoding="utf-8"))
+                    if job["stage"] == "classify" and job["variant"] == "A" and any(
+                            u["text"] == goal for u in job["input"]["units"]):
+                        skipped.add(q)
+                        continue
+                    paths.append(q)
+                keep.append((b[0], b[1], paths))
+            self.answer(keep)
+        self.assertTrue(last.startswith("DONE"), last)
+        self.assertIn("failed_jobs=1", last)
+        self.assertTrue(skipped)
+        rnd = self.round()
+        for d in self.decision_ids():
+            self.assertNotIn(goal, [g["plan_text"] for g in rnd.link_input("link_r1", d)["candidates"]])
+
     def test_reinit_reuses_cache(self):
         self.init()
         first, _ = self.drive()
@@ -529,22 +603,29 @@ class LinkFlowTest(unittest.TestCase):
         self.assertEqual(self.next().stdout.strip(), first)
 
     def test_editing_a_unit_relinks_only_dependent_decisions(self):
+        far = "遠くの読み直しの理由を書く。"
+        base = self.labels
+        # インスタンスの属性に置くので、self を取らない関数のまま差し替える
+        self.labels = lambda stage, variant, uid, text: ([decision(text)] if text == far
+                                                         else base(stage, variant, uid, text))
         self.init()
         self.drive()
-        # 「無関係な文その7。」は「監視は」の決定の候補（同じ H2 でなく前後5単位でもない）に入らない
         text = self.plan.read_text(encoding="utf-8").replace("無関係な文その7。", "無関係な文その七。")
         self.plan.write_text(text, encoding="utf-8")
         self.init()
         _, stages = self.drive()
         jobs = sorted((self.work / "jobs" / "link_r1").glob("link_r1_*_????????.json"))
-        self.assertEqual(jobs, [])  # どの決定の候補にも入っていないので、根拠付けし直さない
+        # 「その7」を前後5単位に含む遠くの決定だけが根拠付けし直しになる（Tick と監視の決定の候補には入っていない）
+        self.assertEqual([json.loads(j.read_text(encoding="utf-8"))["input"]["target"]["plan_text"] for j in jobs], [far])
         text = text.replace("監視は使わない。", "監視は決して使わない。")
         self.plan.write_text(text, encoding="utf-8")
         self.init()
         self.drive()
         jobs = sorted((self.work / "jobs" / "link_r1").glob("link_r1_*_????????.json"))
-        # 直した単位そのものの決定と、それを候補に含む Tick の決定の2件
-        self.assertEqual(len(jobs), 2)
+        targets = sorted(json.loads(j.read_text(encoding="utf-8"))["input"]["target"]["plan_text"] for j in jobs)
+        # 直した単位そのものの決定と、それを候補に含む Tick の決定の2件。遠くの決定（3件目）は出ない
+        self.assertEqual(targets, ["監視は決して使わない。", "読み直しは `Tick` の頭で1回だけ行う。"])
+        self.assertEqual(len(self.decision_ids()), 3)
 
     def test_tampered_link_input_stops(self):
         self.init()

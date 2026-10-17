@@ -1401,7 +1401,8 @@ class Round:
     def link_answer(self, decision_id):
         """決定の根拠付けの答え（r2 を作った決定は r2、無ければ r1）。無ければ None。後の段とテストが使う。
 
-        Round を作ると nodes.jsonl を消す（__init__）ので、next の外から呼ぶ段はそれを踏まえて作る。
+        Round を作ると nodes.jsonl を消し（__init__）、ノードを作り直す途中で jobs/round.json が無ければ周の印を決めて書く
+        （failed_units → round_id）。next の外から呼ぶ段は、それを踏まえて作る。
         """
         for stage in ("link_r2", "link_r1"):
             job_input = self.link_input(stage, decision_id)

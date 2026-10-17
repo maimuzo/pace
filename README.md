@@ -10,7 +10,7 @@ AI が書いた設計プランから根拠のグラフを作り、根拠の無�
 
 - macOS か Linux（確かめたのは macOS だけです）
 - Python 3.9 以上（標準ライブラリだけを使います。macOS の Command Line Tools の `python3` で動きます）
-- Claude Code（確かめたのは 2.1.301 だけです。ほかの版では、権限とモデルの振る舞いが違いうります。たとえば公式文書の要約では、2.1.251 より前は `CLAUDE_CODE_SUBAGENT_MODEL` が agent の定義の `model` より優先されます）
+- Claude Code（確かめたのは 2.1.301 と 2.1.302 だけです。根拠付けは 2.1.302 で確かめました。ほかの版では、権限とモデルの振る舞いが違いうります。たとえば公式文書の要約では、2.1.251 より前は `CLAUDE_CODE_SUBAGENT_MODEL` が agent の定義の `model` より優先されます）
 
 ## 入れ方
 
