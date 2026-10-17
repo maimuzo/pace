@@ -34,7 +34,7 @@ allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)
    ```
 
    - 0 以外で終わったら、標準エラーをそのまま見せて止まります。
-   - `DONE` で始まる行が出たら、その行を見せて止まります（決定と前提の数、失敗したジョブの数です。決定ごとの根拠付けまで終わっています）。
+   - `DONE` で始まる行が出たら、その行を見せて止まります（決定と前提の数、失敗したジョブの数です。`failed_jobs` が0なら、決定ごとの根拠付けまで終わっています。0でないときは、根拠付けの答えが無い決定がありえます）。
 
 3. `next` の出力は、束ごとに `BUNDLE <束の ID> <agent>` の行と、そのあとに続く `JOB <ジョブファイルの絶対パス>` の行です（`JOB ` のあとの行の残り全部が1つのパスです）。束ごとに Agent を1回呼びます。
    - `subagent_type` は、`BUNDLE` の行の agent（`pace:pace-worker` か `pace:pace-judge`）にします。model は渡しません。

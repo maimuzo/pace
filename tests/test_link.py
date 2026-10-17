@@ -129,6 +129,32 @@ class CandidateTest(unittest.TestCase):
         self.assertNotIn("無関係な文その7。", texts)  # どれにも当たらない
         self.assertNotIn("遠くの読み直しの理由を書く。", texts)
 
+    def test_opening_and_same_h2_rules_alone(self):
+        """前後5単位から外れた単位だけで、冒頭の節と同じ H2 の塊の規則を確かめる。"""
+        filler = "".join("## 埋め%d\n\n埋め%d。\n\n" % (i, i) for i in range(6))
+        body = "".join("同じ節の文%d。\n" % i for i in range(10))
+        units = units_of("# 題\n\n冒頭の前提。\n\n## 目標\n\n目標の文。\n\n" + filler + "## 本題\n\n" + body)
+        nodes = nodes_for(units, lambda u: [premise(u["text"])])
+        target = next(n for n in nodes if n["text"] == "同じ節の文9。")
+        target = dict(target, kind="decision", alternatives=["別"])
+        nodes = [target if n["id"] == target["id"] else n for n in nodes]
+        texts = candidate_texts(pace.select_candidates(units, nodes, target))
+        pos = {u["text"]: i for i, u in enumerate(units)}
+        t = pos["同じ節の文9。"]
+        for far in ("冒頭の前提。", "目標の文。", "同じ節の文0。", "本題"):
+            self.assertGreater(t - pos[far], pace.WINDOW, far)  # 前後5単位では入らない位置
+            self.assertIn(far, texts)
+        self.assertNotIn("埋め1。", texts)  # どの規則にも当たらない
+
+    def test_one_decision_over_limit_has_no_candidates(self):
+        units = units_of("# 題\n\n## 節\n\n" + "長" * (pace.LINK_JOB_MAX_CHARS + 10) + "。\n\n短い前提。\n")
+        nodes = nodes_for(units, lambda u: [premise(u["text"])] if u["kind"] == "sentence" else [])
+        target = dict(nodes[0], kind="decision", alternatives=["別"])
+        nodes[0] = target
+        inp = pace.select_candidates(units, nodes, target)
+        self.assertEqual(inp["candidates"], [])
+        self.assertGreater(pace.link_size(inp), pace.LINK_JOB_MAX_CHARS)
+
     def test_identifier_shared(self):
         target = next(n for n in self.nodes if n["unit"] == self.by_text["遠くの読み直しの理由を書く。"]["id"])
         target = dict(target, kind="decision", alternatives=["別"])
@@ -186,8 +212,21 @@ class CandidateTest(unittest.TestCase):
         self.assertEqual(kept, [u["text"] for u in units if u["kind"] == "sentence"][1:len(kept) + 1])
 
     def test_size_ignores_paths_and_errors(self):
+        """字数は指示文と入力だけで測る。ジョブファイルに足す out_path・差し戻しの理由を変えても同じ。"""
         inp = pace.select_candidates(self.units, self.nodes, self.target)
+        short = {"instructions": pace.INSTRUCTIONS["link"], "input": inp, "out_path": "/a"}
+        long_ = dict(short, out_path="/" + "x" * 5000, previous_errors=["理由" * 150] * 3, attempts=3)
+        self.assertNotEqual(len(pace.dumps(short)), len(pace.dumps(long_)))
         self.assertEqual(pace.link_size(inp), len(pace.dumps({"instructions": pace.INSTRUCTIONS["link"], "input": inp})))
+
+    def test_link_bundle_limits(self):
+        self.assertEqual(pace.bundle_limits("link_r1"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
+        self.assertEqual(pace.bundle_limits("link_r2"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
+        self.assertEqual(pace.bundle_limits("classify"), (pace.BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
+        jobs = [{"job_id": "j%d" % i, "pad": "x" * 35000} for i in range(7)]
+        out = pace.Round.bundles(jobs, *pace.bundle_limits("link_r1"))
+        self.assertEqual([len(b) for b in out], [3, 3, 1])  # 120,000字に35,000字台が3件
+        self.assertTrue(all(sum(len(pace.dumps(j)) for j in b) <= pace.LINK_BUNDLE_MAX_CHARS for b in out))
 
     def test_failed_unit_nodes_are_not_candidates(self):
         gone = self.by_text["監視は使わない。"]["id"]
@@ -271,6 +310,8 @@ class CheckLinkTest(unittest.TestCase):
         self.bad(self.ok(steps=[{"from": ["P_zz_1"], "to": "D_x_1", "warrant": "w"},
                                 {"from": ["g1"], "to": "D_x_1", "warrant": "w"}]), "どれでもない")
         self.bad(self.ok(steps=[{"from": ["P_a_1", "g1"], "to": "D_b_1", "warrant": "w"}]), "to が")
+        self.bad(self.ok(steps=[{"from": ["P_a_1", "g1"], "to": ["D_x_1"], "warrant": "w"}]), "to が")
+        self.bad(self.ok(steps=[{"from": ["P_a_1", "g1"], "to": {"id": "D_x_1"}, "warrant": "w"}]), "to が")
         self.bad(self.ok(steps=[{"from": ["P_a_1", "g1"], "to": "c1", "warrant": "w"}]), "step がありません")
         self.bad(self.ok(steps=[{"from": ["c1", "g1"], "to": "c1", "warrant": "w"},
                                 {"from": ["P_a_1"], "to": "D_x_1", "warrant": "w"}]), "自己参照")
@@ -414,8 +455,11 @@ class LinkFlowTest(unittest.TestCase):
         self.assertIsNone(rnd.link_answer(tick))
         others = [d for d in self.decision_ids() if d != tick]
         self.assertTrue(all(rnd.link_answer(d) is not None for d in others))
-        # 根拠付けの失敗ではノードを消さない
+        # 根拠付けの失敗ではノードを消さないので、ほかの決定の候補に失敗した決定が残る
         self.assertIn(tick, [n["id"] for n in rnd.node_list()])
+        for d in others:
+            ids = [n["id"] for g in rnd.link_input("link_r1", d)["candidates"] for n in g["nodes"]]
+            self.assertIn(tick, ids)
 
     def test_r2_only_failure_is_not_replaced_by_r1(self):
         self.init()
@@ -436,6 +480,47 @@ class LinkFlowTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("init を打ち直して", r.stderr)
         self.assertFalse((self.work / "nodes.jsonl").exists())
+
+    def test_missing_r2_answer_stops(self):
+        self.init()
+
+        def link_for(job):
+            if job["stage"] == "link_r1" and "Tick" in job["input"]["target"]["plan_text"]:
+                return gap_answer(job, ["遠くの読み直しの理由"])
+            return gap_answer(job)
+
+        self.drive(link_for)
+        r2 = json.loads(next((self.work / "jobs" / "link_r2").glob("link_r2_*_????????.json")).read_text(encoding="utf-8"))
+        rnd = self.round()
+        key = rnd.link_key(rnd.link_input("link_r2", r2["input"]["target"]["id"]))
+        (self.work / "cache" / (key + ".json")).unlink()
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("init を打ち直して", r.stderr)
+
+    def test_job_names_and_paths_do_not_change_inputs(self):
+        """ジョブの名前の形と、作業ディレクトリのパスの長さで入力が変わらないこと。"""
+        inputs = []
+        for sub in ("a", "b" * 120):
+            d = self.dir / sub
+            d.mkdir()
+            plan = d / "plan.md"
+            plan.write_text(PLAN, encoding="utf-8")
+            self.plan = plan
+            self.work = d / ".pace" / "plan"
+            self.init()
+            for _ in range(5):
+                bundles, _ = parse(self.next().stdout)
+                paths = [q for _, _, ps in bundles for q in ps]
+                job = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+                if job["stage"] == "link_r1":
+                    break
+                self.answer(bundles)
+            for q in paths:
+                self.assertRegex(Path(q).name, r"^link_r1_D_[0-9a-f]{8}_1_[0-9a-f]{8}\.json$")
+            inputs.append(sorted(json.dumps(json.loads(Path(q).read_text(encoding="utf-8"))["input"],
+                                            ensure_ascii=False, sort_keys=True) for q in paths))
+        self.assertEqual(inputs[0], inputs[1])
 
     def test_reinit_reuses_cache(self):
         self.init()
@@ -470,13 +555,18 @@ class LinkFlowTest(unittest.TestCase):
             if job["stage"] == "link_r1":
                 break
             self.answer(bundles)
-        job["input"]["candidates"].append({"section": "", "plan_text": "偽", "nodes": [{"id": "P_ffffffff_1",
-                                                                                    "kind": "fact", "text": "偽"}]})
-        Path(paths[0]).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
-        r = self.next(ok=False)
-        self.assertEqual(r.returncode, 1)
-        self.assertIn("init を打ち直して", r.stderr)
-        self.assertNotIn("Traceback", r.stderr)
+        original = Path(paths[0]).read_text(encoding="utf-8")
+        fake = {"section": "", "plan_text": "偽", "nodes": [{"id": "P_ffffffff_1", "kind": "fact", "text": "偽"}]}
+        for name, change in (("candidates", lambda j: j["input"]["candidates"].append(fake)),
+                             ("target", lambda j: j["input"]["target"].update(text="書き換えた決定"))):
+            with self.subTest(name=name):
+                j = json.loads(original)
+                change(j)
+                Path(paths[0]).write_text(json.dumps(j, ensure_ascii=False), encoding="utf-8")
+                r = self.next(ok=False)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("init を打ち直して", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
 
     def test_bad_answer_is_sent_back(self):
         self.init()

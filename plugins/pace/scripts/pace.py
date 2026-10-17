@@ -848,7 +848,8 @@ def check_link(answer, link_input):
             raise ValueError("%s の from に、候補のノード・自分の claims・gaps のどれでもない id があります: %s"
                              % (where, ", ".join(repr(b) for b in bad)))
         to = step.get("to")
-        if to != target and to not in claim_ids:
+        # 型を先に確かめる（配列やオブジェクトを set に照らすと TypeError で next が落ち、差し戻せなくなる）
+        if not isinstance(to, str) or (to != target and to not in claim_ids):
             raise ValueError("%s の to が target.id か claims の id ではありません: %r" % (where, to))
         if to in froms:
             raise ValueError("%s の from に to が入っています（自己参照）: %s" % (where, to))
@@ -1398,7 +1399,10 @@ class Round:
                     raise PaceError("決定 %s の根拠付けの答えがありません。init を打ち直してください" % d["id"])
 
     def link_answer(self, decision_id):
-        """決定の根拠付けの答え（r2 を作った決定は r2、無ければ r1）。無ければ None。後の段とテストが使う。"""
+        """決定の根拠付けの答え（r2 を作った決定は r2、無ければ r1）。無ければ None。後の段とテストが使う。
+
+        Round を作ると nodes.jsonl を消す（__init__）ので、next の外から呼ぶ段はそれを踏まえて作る。
+        """
         for stage in ("link_r2", "link_r1"):
             job_input = self.link_input(stage, decision_id)
             if job_input is not None:
