@@ -233,11 +233,11 @@ class CandidateTest(unittest.TestCase):
         self.assertLess(len(whole["candidates"]), len(inp["candidates"]))
 
     def test_link_bundle_limits(self):
-        self.assertEqual(pace.bundle_limits("link_r1"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
-        self.assertEqual(pace.bundle_limits("link_r2"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
+        self.assertEqual(pace.bundle_limits("link_r1_1"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
+        self.assertEqual(pace.bundle_limits("link_r2_1"), (pace.LINK_BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
         self.assertEqual(pace.bundle_limits("classify"), (pace.BUNDLE_MAX_CHARS, pace.BUNDLE_MAX_JOBS))
         jobs = [{"job_id": "j%d" % i, "pad": "x" * 35000} for i in range(7)]
-        out = pace.Round.bundles(jobs, *pace.bundle_limits("link_r1"))
+        out = pace.Round.bundles(jobs, *pace.bundle_limits("link_r1_1"))
         self.assertEqual([len(b) for b in out], [3, 3, 1])  # 120,000字に35,000字台が3件
         self.assertTrue(all(sum(len(pace.dumps(j)) for j in b) <= pace.LINK_BUNDLE_MAX_CHARS for b in out))
 
@@ -443,20 +443,20 @@ class LinkFlowTest(unittest.TestCase):
         self.init()
 
         def link_for(job):
-            if job["stage"] == "link_r1" and "Tick" in job["input"]["target"]["plan_text"]:
+            if job["stage"] == "link_r1_1" and "Tick" in job["input"]["target"]["plan_text"]:
                 return gap_answer(job, ["遠くの読み直しの理由"])
             return gap_answer(job)
 
         last, stages = self.drive(link_for)
         self.assertEqual(last, "DONE decisions=2 premises=16 failed_jobs=0")
-        self.assertIn(["link_r1"], stages)
-        self.assertIn(["link_r2"], stages)
-        r2 = sorted((self.work / "jobs" / "link_r2").glob("link_r2_*_????????.json"))
+        self.assertIn(["link_r1_1"], stages)
+        self.assertIn(["link_r2_1"], stages)
+        r2 = sorted((self.work / "jobs" / "link_r2_1").glob("link_r2_1_*_????????.json"))
         self.assertEqual(len(r2), 1)
         job = json.loads(r2[0].read_text(encoding="utf-8"))
         self.assertTrue(job["input"]["added"])
         self.assertEqual(job["input"]["previous"]["need"], ["遠くの読み直しの理由"])
-        self.assertEqual(job["stage"], "link_r2")
+        self.assertEqual(job["stage"], "link_r2_1")
         self.assertTrue(Path(job["out_path"]).is_absolute())
         rnd = self.round()
         for d in self.decision_ids():
@@ -468,7 +468,7 @@ class LinkFlowTest(unittest.TestCase):
         for _ in range(5):
             bundles, last = parse(self.next().stdout)
             stage = {json.loads(Path(p).read_text(encoding="utf-8"))["stage"] for _, _, ps in bundles for p in ps}
-            if stage == {"link_r1"}:
+            if stage == {"link_r1_1"}:
                 self.assertEqual([a for _, a, _ in bundles], ["pace:pace-worker"])
                 job = json.loads(Path(bundles[0][2][0]).read_text(encoding="utf-8"))
                 self.assertEqual(job["prompt_version"], dict(pace.STAGE_VERSIONS)["link"])
@@ -483,19 +483,19 @@ class LinkFlowTest(unittest.TestCase):
             tick = "Tick" in job["input"]["target"]["plan_text"]
             if tick and job["stage"] == which:
                 return None
-            if tick and job["stage"] == "link_r1":
+            if tick and job["stage"] == "link_r1_1":
                 return gap_answer(job, ["遠くの読み直しの理由"])
             return gap_answer(job)
         return self.drive(link_for)
 
     def test_r1_failure(self):
         self.init()
-        last, _ = self.fail_link("link_r1")
+        last, _ = self.fail_link("link_r1_1")
         self.assertEqual(last, "DONE decisions=2 premises=16 failed_jobs=1")
         rec = [json.loads(x) for x in (self.work / "failed_jobs.jsonl").read_text().splitlines()]
         self.assertEqual(len(rec), 1)
         self.assertEqual(rec[0]["units"], [])
-        self.assertEqual(rec[0]["stage"], "link_r1")
+        self.assertEqual(rec[0]["stage"], "link_r1_1")
         tick = rec[0]["decision"]
         rnd = self.round()
         self.assertIsNone(rnd.link_answer(tick))
@@ -504,15 +504,15 @@ class LinkFlowTest(unittest.TestCase):
         # 根拠付けの失敗ではノードを消さないので、ほかの決定の候補に失敗した決定が残る
         self.assertIn(tick, [n["id"] for n in rnd.node_list()])
         for d in others:
-            ids = [n["id"] for g in rnd.link_input("link_r1", d)["candidates"] for n in g["nodes"]]
+            ids = [n["id"] for g in rnd.link_input("link_r1_1", d)["candidates"] for n in g["nodes"]]
             self.assertIn(tick, ids)
 
     def test_r2_only_failure_is_not_replaced_by_r1(self):
         self.init()
-        last, _ = self.fail_link("link_r2")
+        last, _ = self.fail_link("link_r2_1")
         self.assertEqual(last, "DONE decisions=2 premises=16 failed_jobs=1")
         rec = json.loads((self.work / "failed_jobs.jsonl").read_text().splitlines()[0])
-        self.assertEqual(rec["stage"], "link_r2")
+        self.assertEqual(rec["stage"], "link_r2_1")
         self.assertIsNone(self.round().link_answer(rec["decision"]))
 
     def test_missing_link_answer_stops(self):
@@ -531,14 +531,14 @@ class LinkFlowTest(unittest.TestCase):
         self.init()
 
         def link_for(job):
-            if job["stage"] == "link_r1" and "Tick" in job["input"]["target"]["plan_text"]:
+            if job["stage"] == "link_r1_1" and "Tick" in job["input"]["target"]["plan_text"]:
                 return gap_answer(job, ["遠くの読み直しの理由"])
             return gap_answer(job)
 
         self.drive(link_for)
-        r2 = json.loads(next((self.work / "jobs" / "link_r2").glob("link_r2_*_????????.json")).read_text(encoding="utf-8"))
+        r2 = json.loads(next((self.work / "jobs" / "link_r2_1").glob("link_r2_1_*_????????.json")).read_text(encoding="utf-8"))
         rnd = self.round()
-        key = rnd.link_key(rnd.link_input("link_r2", r2["input"]["target"]["id"]))
+        key = rnd.link_key(rnd.link_input("link_r2_1", r2["input"]["target"]["id"]))
         (self.work / "cache" / (key + ".json")).unlink()
         r = self.next(ok=False)
         self.assertEqual(r.returncode, 1)
@@ -559,11 +559,11 @@ class LinkFlowTest(unittest.TestCase):
                 bundles, _ = parse(self.next().stdout)
                 paths = [q for _, _, ps in bundles for q in ps]
                 job = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
-                if job["stage"] == "link_r1":
+                if job["stage"] == "link_r1_1":
                     break
                 self.answer(bundles)
             for q in paths:
-                self.assertRegex(Path(q).name, r"^link_r1_D_[0-9a-f]{8}_1_[0-9a-f]{8}\.json$")
+                self.assertRegex(Path(q).name, r"^link_r1_1_D_[0-9a-f]{8}_1_[0-9a-f]{8}\.json$")
             inputs.append(sorted(json.dumps(json.loads(Path(q).read_text(encoding="utf-8"))["input"],
                                             ensure_ascii=False, sort_keys=True) for q in paths))
         self.assertEqual(inputs[0], inputs[1])
@@ -594,7 +594,7 @@ class LinkFlowTest(unittest.TestCase):
         self.assertTrue(skipped)
         rnd = self.round()
         for d in self.decision_ids():
-            self.assertNotIn(goal, [g["plan_text"] for g in rnd.link_input("link_r1", d)["candidates"]])
+            self.assertNotIn(goal, [g["plan_text"] for g in rnd.link_input("link_r1_1", d)["candidates"]])
 
     def test_reinit_reuses_cache(self):
         self.init()
@@ -614,14 +614,14 @@ class LinkFlowTest(unittest.TestCase):
         self.plan.write_text(text, encoding="utf-8")
         self.init()
         _, stages = self.drive()
-        jobs = sorted((self.work / "jobs" / "link_r1").glob("link_r1_*_????????.json"))
+        jobs = sorted((self.work / "jobs" / "link_r1_1").glob("link_r1_1_*_????????.json"))
         # 「その7」を前後5単位に含む遠くの決定だけが根拠付けし直しになる（Tick と監視の決定の候補には入っていない）
         self.assertEqual([json.loads(j.read_text(encoding="utf-8"))["input"]["target"]["plan_text"] for j in jobs], [far])
         text = text.replace("監視は使わない。", "監視は決して使わない。")
         self.plan.write_text(text, encoding="utf-8")
         self.init()
         self.drive()
-        jobs = sorted((self.work / "jobs" / "link_r1").glob("link_r1_*_????????.json"))
+        jobs = sorted((self.work / "jobs" / "link_r1_1").glob("link_r1_1_*_????????.json"))
         targets = sorted(json.loads(j.read_text(encoding="utf-8"))["input"]["target"]["plan_text"] for j in jobs)
         # 直した単位そのものの決定と、それを候補に含む Tick の決定の2件。遠くの決定（3件目）は出ない
         self.assertEqual(targets, ["監視は決して使わない。", "読み直しは `Tick` の頭で1回だけ行う。"])
@@ -633,7 +633,7 @@ class LinkFlowTest(unittest.TestCase):
             bundles, _ = parse(self.next().stdout)
             paths = [p for _, _, ps in bundles for p in ps]
             job = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
-            if job["stage"] == "link_r1":
+            if job["stage"] == "link_r1_1":
                 break
             self.answer(bundles)
         original = Path(paths[0]).read_text(encoding="utf-8")
@@ -655,7 +655,7 @@ class LinkFlowTest(unittest.TestCase):
             bundles, _ = parse(self.next().stdout)
             paths = [p for _, _, ps in bundles for p in ps]
             job = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
-            if job["stage"] == "link_r1":
+            if job["stage"] == "link_r1_1":
                 break
             self.answer(bundles)
         bad = gap_answer(job)

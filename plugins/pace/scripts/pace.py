@@ -3,11 +3,12 @@
 
 いまは --version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）と
 next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化と、
-候補の絞り込み・根拠付け r1・2-gram の追加候補・根拠付け r2 まで）を持つ。
-verify・report・show・shown は後の issue（maimuzo/pace#6 以降）で足す。
+候補の絞り込み・根拠付け r1・2-gram の追加候補・根拠付け r2・輪を断つ反復まで）と
+verify（next が DONE まで進んだ作業ディレクトリを書き換えずに読み、結合したグラフの根への到達と gap の効きを出す）を持つ。
+report・show・shown は後の issue（maimuzo/pace#7）で足す。
 Python 3.9 以上・標準ライブラリだけで動かす。分割と作業ディレクトリの決まりは
 docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは14節（ジョブと束）、
-根拠付けの決まりは15節（根拠付け）にある。
+根拠付けの決まりは15節（根拠付け）、輪を断つ反復と結合の決まりは16節にある。
 """
 
 import argparse
@@ -29,8 +30,8 @@ from pathlib import Path
 STAGE_VERSIONS = (
     ("classify", "2026-10-16.1"),
     ("adjudicate", "2026-10-16.1"),
-    ("link", "2026-10-16.1"),
-    ("decycle", "2026-10-16.1"),
+    ("link", "2026-10-17.1"),
+    ("decycle", "2026-10-17.1"),
     ("review", "2026-10-16.1"),
 )
 
@@ -588,17 +589,44 @@ MAX_CANDIDATES = 80
 EXPAND_PER_NEED = 6
 EXPAND_MAX = 12
 
+# 輪を断つ段の回数の上限（docs/idea.md 付録B の MAX_DECYCLE_ITER）。decycle_5 で切ったあとに回6の根拠付けをして
+# 終えるので、根拠付けは最大6回（16節）
+MAX_DECYCLE = 5
+PASSES = MAX_DECYCLE + 1
+
 AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
-STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge", "link": "pace-worker"}
-JOB_STAGES = ("classify", "adjudicate", "link_r1", "link_r2")
+STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge", "link": "pace-worker", "decycle": "pace-judge"}
+
+
+def _job_stages():
+    """段の並び。根拠付けと輪を断つ段は回ごとに別の段にし、名前に回の番号を入れる（link_r1_2 など）。"""
+    out = ["classify", "adjudicate"]
+    for k in range(1, PASSES + 1):
+        out += ["link_r1_%d" % k, "link_r2_%d" % k]
+        if k <= MAX_DECYCLE:
+            out.append("decycle_%d" % k)
+    return tuple(out)
+
+
+JOB_STAGES = _job_stages()
 # ノードを作る段（ここの失敗だけが、ノードの無い単位になる）
 NODE_STAGES = ("classify", "adjudicate")
 PTYPES = ("fact", "requirement", "value")
+PASS_STAGE = re.compile(r"(link_r[12]|decycle)_([1-9])")
 
 
 def stage_kind(stage):
-    """ジョブの段（link_r1・link_r2）を、版・指示文・agent・キャッシュの鍵の段の名前（link）に寄せる。"""
-    return "link" if stage in ("link_r1", "link_r2") else stage
+    """ジョブの段（link_r1_2・decycle_1 など）を、版・指示文・agent・キャッシュの鍵の段の名前（link・decycle）に寄せる。"""
+    m = PASS_STAGE.fullmatch(stage)
+    if m is None:
+        return stage
+    return "decycle" if m.group(1) == "decycle" else "link"
+
+
+def stage_pass(stage):
+    """段の回の番号（分類と裁定は 0）。"""
+    m = PASS_STAGE.fullmatch(stage)
+    return int(m.group(2)) if m else 0
 
 
 def bundle_limits(stage):
@@ -606,7 +634,8 @@ def bundle_limits(stage):
         return LINK_BUNDLE_MAX_CHARS, BUNDLE_MAX_JOBS
     return BUNDLE_MAX_CHARS, BUNDLE_MAX_JOBS
 
-# 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足し、裁定には文脈を確かめる1文を足したもの。
+# 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足し、裁定には文脈を確かめる1文を足したもの（根拠付けと輪を断つ段は
+# それぞれの上のコメント）。
 # 変えるとキャッシュの鍵（指示文の sha256）が変わるので、古い答えは使われない。出力の形を変えたら段の版も上げる
 INSTRUCTIONS = {
     "classify": """あなたは設計プランの文を分類する。input.units の各単位（文・箇条書き・表の1行・見出し・コードの1行）に、次のラベルを付けよ。単位の種類は kind にあり、code_line はコードブロックの中の1行である。
@@ -621,7 +650,8 @@ input.units のすべての uid を、過不足なく1回ずつ出すこと。""
 section_path と neighbors で文脈を確かめること。
 出力は JSON: {"labels":[{"kind":"decision","text":"...","alternatives":["..."]} | {"kind":"premise","ptype":"fact","text":"..."}]}""",
     # docs/idea.md 付録A の [link] の全文に、gaps を必ず from に入れる規則（実験時に依頼文で足していたもの。
-    # docs/idea.md:633 が指示文に入れるよう勧めている）と、入力の形の説明3文を足したもの
+    # docs/idea.md:633 が指示文に入れるよう勧めている）と、入力の形の説明3文と、excluded_note の規則（実験時に依頼文で
+    # 足していたもの。16節）を足したもの
     "link": """設計プランの1つの決定（input.target）について、それを支える理由を input.candidates の中から探し、推論の段（step）として書け。
 規則:
 1. input.candidates はプランの単位ごとのまとまりで、plan_text がプランの原文、nodes がその単位から取り出した決定・前提である。根拠の葉は nodes の id だけ。candidates に無いことを根拠にしてはならない。candidates の他の決定（kind=decision）も根拠に使ってよい。
@@ -634,7 +664,15 @@ claims と gaps の id は c1, c2, ... / g1, g2, ... とする。step の to は
 input.previous があれば、それは前回のあなたの結果である。追加された candidates を使って全体を書き直せ。
 gaps に書いたものは必ずどれかの step の from に入れること。
 nodes の kind は decision か、前提の種類（fact / requirement / value）である。plan_text はコードブロックの1行のこともある。
-input.added は、追加された candidates のノードの id である。""",
+input.added は、追加された candidates のノードの id である。
+input.excluded_note の決定は、輪を断つ段で target の本当の理由ではないとされた。理由に使ってはならない。""",
+    # docs/idea.md 付録A の [decycle] の全文に、plan_text の説明の1文を足したもの
+    "decycle": """設計プランの決定どうしが、互いを理由にし合って輪（循環論法）になっている。輪は根拠にならない。
+input.nodes は輪の中の決定、input.edges は「from の決定を理由にして to の決定を根拠付けた」辺で、warrants はその理由の説明である。
+各辺について、from が本当に to より先に決まっている理由（前提・制約）なのか、それとも to と並列の決定や、to から導かれる帰結にすぎないのかを判断し、本当の理由ではない辺を切れ。
+切った後に輪が1つも残らないようにすること（スクリプトが検査する）。切る辺はできるだけ少なくし、それぞれ理由を書く。
+出力は JSON: {"cuts":[{"from":"...","to":"...","reason":"..."}]}
+nodes の plan_text はプランの原文である。""",
 }
 
 
@@ -694,6 +732,9 @@ def valid_job(obj):
         # 入力そのものは load_job が、プランとキャッシュから作り直したものと突き合わせる
         target = obj["input"].get("target")
         return isinstance(target, dict) and isinstance(target.get("id"), str)
+    if stage_kind(obj["stage"]) == "decycle":
+        # 輪を断つ段も、入力は load_job が作り直したものと突き合わせる
+        return isinstance(obj["input"].get("nodes"), list) and isinstance(obj["input"].get("edges"), list)
     if obj["stage"] == "classify":
         units = obj["input"].get("units")
         return isinstance(units, list) and bool(units) and all(
@@ -713,8 +754,9 @@ def encodable(text):
 
 # 作業ディレクトリのファイルから読んでパスに使う名前の形。ほかの形（`../` を含むものなど）は形の誤りとして断る
 ROUND_ID = re.compile(r"[0-9a-f]{8}")
-JOB_ID = re.compile(r"(?:classify_([AB])_[0-9]{3,}|adjudicate_(u[0-9a-f]{8}(?:_[0-9]+)?)"
-                    r"|link_r[12]_(D_[0-9a-f]{8}(?:_[0-9]+)?_[0-9]+))_[0-9a-f]{8}")
+JOB_ID = re.compile(r"(?:classify_(?P<variant>[AB])_[0-9]{3,}|adjudicate_(?P<uid>u[0-9a-f]{8}(?:_[0-9]+)?)"
+                    r"|link_r[12]_[1-9]_(?P<decision>D_[0-9a-f]{8}(?:_[0-9]+)?_[0-9]+)"
+                    r"|decycle_[1-9]_(?P<seq>[0-9]{3,}))_[0-9a-f]{8}")
 
 # 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
 ERROR_MAX_CHARS = 300
@@ -870,6 +912,88 @@ def check_link(answer, link_input):
     return {"claims": claims, "gaps": gaps, "steps": steps, "need": need}
 
 
+def strong_components(nodes, edges):
+    """強連結成分（Tarjan 法。再帰の深さに頼らないよう、手で積む）。
+
+    nodes は順の決まった ID の列、edges は (from, to) の列。2ノード以上の成分だけを、成分の中はノードの順、
+    成分どうしは成分の中でいちばん前のノードの順に並べて返す（輪を断つジョブの連番と入力を毎回同じにするため）。
+    """
+    order = {n: i for i, n in enumerate(nodes)}
+    succ = {n: [] for n in nodes}
+    for f, t in edges:
+        if f in succ and t in succ:
+            succ[f].append(t)
+    index, low, on_stack = {}, {}, set()
+    stack, comps = [], []
+    counter = 0
+    for root in nodes:
+        if root in index:
+            continue
+        work = [(root, 0)]
+        while work:
+            v, i = work.pop()
+            if i == 0:
+                index[v] = low[v] = counter
+                counter += 1
+                stack.append(v)
+                on_stack.add(v)
+            if i < len(succ[v]):
+                work.append((v, i + 1))
+                w = succ[v][i]
+                if w not in index:
+                    work.append((w, 0))
+                elif w in on_stack:
+                    low[v] = min(low[v], index[w])
+                continue
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                if len(comp) >= 2:
+                    comps.append(sorted(comp, key=order.get))
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[v])
+    comps.sort(key=lambda c: order[c[0]])
+    return comps
+
+
+def check_decycle(answer, decycle_input):
+    """輪を断つ答えを、作り直した入力に照らして確かめ、知らないキーを捨てたものを返す。誤りは ValueError。
+
+    切る辺が入力にあり重ならないこと・理由が空でないこと・切ったあと輪が残らないこと（docs/idea.md 段5a）。
+    """
+    if not isinstance(answer, dict):
+        raise ValueError("答えが JSON のオブジェクトではありません")
+    cuts = answer.get("cuts")
+    if not isinstance(cuts, list) or not cuts:
+        raise ValueError('"cuts" が、空でない配列ではありません（輪の中の辺を1本以上切ってください）')
+    edges = [(e["from"], e["to"]) for e in decycle_input["edges"]]
+    have = set(edges)
+    out = []
+    seen = set()
+    for k, cut in enumerate(cuts, start=1):
+        where = "cuts の %d 件目" % k
+        if not isinstance(cut, dict) or not isinstance(cut.get("from"), str) or not isinstance(cut.get("to"), str):
+            raise ValueError("%s の from と to が文字列ではありません" % where)
+        pair = (cut["from"], cut["to"])
+        if pair not in have:
+            raise ValueError("%s の辺が input.edges にありません: %s -> %s" % (where, pair[0], pair[1]))
+        if pair in seen:
+            raise ValueError("%s の辺が2回あります: %s -> %s" % (where, pair[0], pair[1]))
+        seen.add(pair)
+        out.append({"from": pair[0], "to": pair[1], "reason": nonempty_text(cut.get("reason"), "%s の reason" % where)})
+    rest = [e for e in edges if e not in seen]
+    left = strong_components([n["id"] for n in decycle_input["nodes"]], rest)
+    if left:
+        raise ValueError("切ったあとも輪が残ります: %s" % " ".join(left[0]))
+    return {"cuts": out}
+
+
 # ---------------------------------------------------------------------------
 # 候補の絞り込みと 2-gram の追加候補（docs/idea.md 段3・段4a。決まりは15節）
 # ---------------------------------------------------------------------------
@@ -912,30 +1036,48 @@ def link_size(job_input):
     return len(dumps({"instructions": INSTRUCTIONS["link"], "input": job_input}))
 
 
-def select_candidates(units, nodes, decision):
-    """決定1件の r1 の入力を作る。
-
-    同じ H2 の塊・前後5単位・冒頭の節・識別子の共有のどれかに当たる単位のノードを、位置の近い単位から
-    単位ごとに丸ごと入れ、80ノードを超える単位の手前で止める。ジョブが40,000字を超えたら遠い単位から削る。
+def candidate_rule(units, t):
+    """位置 t の単位の決定について、位置 i の単位が候補の規則（同じ H2 の塊・前後5単位・冒頭の節・識別子の共有）に
+    当たるかを返す関数を作る。80件と40,000字の切り落としは見ない（失敗した単位の影響の範囲にも使う。16節）。
     """
-    pos = {u["id"]: i for i, u in enumerate(units)}
-    by_unit = {}
-    for n in nodes:
-        by_unit.setdefault(n["unit"], []).append(n)
     blocks = h2_blocks(units)
     h2_positions = [i for i, u in enumerate(units)
                     if u["kind"] == "heading" and u["sec"] and u["text"] == u["sec"]
                     and (not u["path"] or u["path"][-1] != u["sec"])]
     opening = blocks[h2_positions[0]] if h2_positions else None
-    t = pos[decision["unit"]]
     t_ids = identifiers(units[t]["text"])
+
+    def hit(i):
+        return bool(blocks[i] == blocks[t] or abs(i - t) <= WINDOW or opening is None or blocks[i] <= opening
+                    or (t_ids and t_ids & identifiers(units[i]["text"])))
+    return hit
+
+
+def excluded_note(units, nodes, excluded):
+    """外した決定を、入力の excluded_note の形（ノードの順の [{"text","plan_text"}]）にする。"""
+    texts = {u["id"]: u["text"] for u in units}
+    return [{"text": n["text"], "plan_text": texts[n["unit"]]} for n in nodes if n["id"] in excluded]
+
+
+def select_candidates(units, nodes, decision, excluded=frozenset()):
+    """決定1件の r1 の入力を作る。
+
+    同じ H2 の塊・前後5単位・冒頭の節・識別子の共有のどれかに当たる単位のノードを、位置の近い単位から
+    単位ごとに丸ごと入れ、80ノードを超える単位の手前で止める。ジョブが40,000字を超えたら遠い単位から削る。
+    excluded（輪を断つ段で外した決定）は候補に入れず、excluded_note に入れてから字数を測る（16節）。
+    """
+    pos = {u["id"]: i for i, u in enumerate(units)}
+    by_unit = {}
+    for n in nodes:
+        by_unit.setdefault(n["unit"], []).append(n)
+    t = pos[decision["unit"]]
+    hit = candidate_rule(units, t)
     picked = []
     for i, u in enumerate(units):
-        unit_nodes = [n for n in by_unit.get(u["id"], []) if n["id"] != decision["id"]]
+        unit_nodes = [n for n in by_unit.get(u["id"], []) if n["id"] != decision["id"] and n["id"] not in excluded]
         if not unit_nodes:
             continue
-        if (blocks[i] == blocks[t] or abs(i - t) <= WINDOW or opening is None or blocks[i] <= opening
-                or (t_ids and t_ids & identifiers(u["text"]))):
+        if hit(i):
             picked.append((abs(i - t), i, unit_nodes))
     picked.sort(key=lambda x: (x[0], x[1]))
     groups = []
@@ -950,6 +1092,8 @@ def select_candidates(units, nodes, decision):
     job_input = {"target": {"id": decision["id"], "text": decision["text"], "alternatives": decision["alternatives"],
                             "section": tu["sec"], "plan_text": tu["text"]},
                  "candidates": groups}
+    if excluded:
+        job_input["excluded_note"] = excluded_note(units, nodes, excluded)
     while groups and link_size(job_input) > LINK_JOB_MAX_CHARS:
         groups.pop()
     return job_input
@@ -978,17 +1122,26 @@ def cosine(a, b):
     return dot / (na * nb)
 
 
-def expand_candidates(units, nodes, decision, r1_input, r1_answer, vectors=None):
+def expand_candidates(units, nodes, decision, r1_input, r1_answer, vectors=None, excluded=frozenset()):
     """r1 の答えの need から 2-gram で近いノードを選び、r2 の入力を作る。足すものが無ければ None。
 
+    r2 のジョブが40,000字を超えたら、足したものを類似度の低い順に削る（excluded_note も入れて測る）。
+    """
+    return trim_r2(units, r1_input, r1_answer,
+                   pick_additions(units, nodes, decision, r1_input, r1_answer, vectors, excluded))
+
+
+def pick_additions(units, nodes, decision, r1_input, r1_answer, vectors=None, excluded=frozenset()):
+    """r1 の答えの need から 2-gram で近いノードを選ぶ（削る前）。[(類似度, ノード)] を足した順に返す。
+
     need 1件につき6件・合計12件まで。同点は決定に位置の近い単位・前の単位・単位の中のノードの順。
-    r2 のジョブが40,000字を超えたら、足したものを類似度の低い順に削る。
-    vectors はノードの id から 2-gram へのキャッシュ（同じ next の中で使い回す）。
+    excluded（輪を断つ段で外した決定）は選ばない。vectors はノードの id から 2-gram へのキャッシュ（同じ next の中で使い回す）。
+    字数で r2 を作れなかった決定（足すものはあったが全部削った）を見分けるため、削る部分と分けてある（16節）。
     """
     need = r1_answer["need"]
     pos = {u["id"]: i for i, u in enumerate(units)}
     texts = {u["id"]: u["text"] for u in units}
-    have = {n["id"] for g in r1_input["candidates"] for n in g["nodes"]} | {decision["id"]}
+    have = {n["id"] for g in r1_input["candidates"] for n in g["nodes"]} | {decision["id"]} | set(excluded)
     t = pos[decision["unit"]]
     pool = []
     for order, n in enumerate(nodes):
@@ -1015,6 +1168,12 @@ def expand_candidates(units, nodes, decision, r1_input, r1_answer, vectors=None)
                 break
             chosen.add(s[4]["id"])
             added.append((-s[0], s[4]))
+    return added
+
+
+def trim_r2(units, r1_input, r1_answer, added):
+    """足したものから r2 の入力を作り、40,000字を超える間は類似度の低いものから削る。0件になれば None。"""
+    added = list(added)
     while added:
         job_input = r2_input(units, r1_input, [n for _, n in added], r1_answer)
         if link_size(job_input) <= LINK_JOB_MAX_CHARS:
@@ -1026,7 +1185,10 @@ def expand_candidates(units, nodes, decision, r1_input, r1_answer, vectors=None)
 
 
 def r2_input(units, r1_input, added, previous):
-    """r1 の入力に、足したノード（同じ単位のまとまりがあればそこへ、無ければ後ろに）と added・previous を足す。"""
+    """r1 の入力に、足したノード（同じ単位のまとまりがあればそこへ、無ければ後ろに）と added・previous を足す。
+
+    r1 の入力の excluded_note も写す（r1 と r2 で、AI に渡す規則の材料を揃える）。
+    """
     texts = {u["id"]: (u["sec"], u["text"]) for u in units}
     groups = [dict(g, nodes=list(g["nodes"])) for g in r1_input["candidates"]]
     new_groups = {}
@@ -1036,14 +1198,106 @@ def r2_input(units, r1_input, added, previous):
             new_groups[n["unit"]] = {"section": sec, "plan_text": text, "nodes": []}
             groups.append(new_groups[n["unit"]])
         new_groups[n["unit"]]["nodes"].append(node_entry(n))
-    return {"target": r1_input["target"], "candidates": groups, "added": [n["id"] for n in added],
-            "previous": previous}
+    out = {"target": r1_input["target"], "candidates": groups}
+    if "excluded_note" in r1_input:
+        out["excluded_note"] = r1_input["excluded_note"]
+    out.update({"added": [n["id"] for n in added], "previous": previous})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 結合と検証（docs/idea.md 段5。決まりは16節）
+# ---------------------------------------------------------------------------
+
+UNGROUNDED, NEEDS_GAP, ROOTED = 0, 1, 2
+STATUS_NAMES = {UNGROUNDED: "ungrounded", NEEDS_GAP: "needs_gap", ROOTED: "rooted"}
+
+
+def strengths(decision_ids, answers, fixed=None, premises=frozenset()):
+    """決定ごとの強さ（ungrounded < needs_gap < rooted）を、最小の不動点で計算する。
+
+    premise は rooted、gap は needs_gap、step の強さは from のいちばん弱いもの、ノードは step のいちばん強いもの、
+    step の無いノードは ungrounded。全部を ungrounded から始めて変わらなくなるまで繰り返すので、輪の中だけで支え合う
+    決定は ungrounded のまま残る（docs/idea.md:135・438 の「循環の中でしか支えられていない」）。
+    fixed は強さを決めておく決定（楽観の計算の U、自前の推論の完結で rooted とみなすほかの決定）。
+    """
+    fixed = fixed or {}
+    value = {d: fixed.get(d, UNGROUNDED) for d in decision_ids}
+    claims = {}
+    changed = True
+    while changed:
+        changed = False
+        for d in decision_ids:
+            answer = answers.get(d)
+            if d in fixed or answer is None:
+                continue
+            gaps = {g["id"] for g in answer["gaps"]}
+            local = claims.setdefault(d, {c["id"]: UNGROUNDED for c in answer["claims"]})
+            best = {}
+            for step in answer["steps"]:
+                vals = []
+                for f in step["from"]:
+                    if f in gaps:
+                        vals.append(NEEDS_GAP)
+                    elif f in local:
+                        vals.append(local[f])
+                    elif f in value:
+                        vals.append(value[f])
+                    elif f in premises:
+                        vals.append(ROOTED)
+                    else:
+                        # 候補のノードで決定でも前提でもないもの（作り直したノードに無い）は根拠にしない
+                        vals.append(UNGROUNDED)
+                s = min(vals)
+                best[step["to"]] = max(best.get(step["to"], UNGROUNDED), s)
+            for c, v in best.items():
+                if c == d:
+                    if v > value[d]:
+                        value[d] = v
+                        changed = True
+                elif c in local and v > local[c]:
+                    local[c] = v
+                    changed = True
+    return value
+
+
+def leverage(decision_ids, answers, status):
+    """gap ごとの効き {(決定, gap の id): 決定の数}（idea.md:137 に寄せた近似。多めに数える）。
+
+    状態が needs_gap の決定から、自分の答えの辺を理由の側へ、needs_gap の決定だけを通って推移的に辿り、
+    届いた決定の gap を数える（rooted・ungrounded・unverified の決定には入らない）。
+    """
+    ids = set(decision_ids)
+    count = {}
+    for start in decision_ids:
+        if status[start] != "needs_gap":
+            continue
+        seen = {start}
+        todo = [start]
+        while todo:
+            d = todo.pop()
+            answer = answers.get(d)
+            if answer is None:
+                continue
+            for g in answer["gaps"]:
+                count[(d, g["id"])] = count.get((d, g["id"]), 0) + 1
+            for step in answer["steps"]:
+                for f in step["from"]:
+                    if f in ids and f not in seen and status.get(f) == "needs_gap":
+                        seen.add(f)
+                        todo.append(f)
+    return count
 
 
 class Round:
-    """1回の next が扱う、1つのプランの作業ディレクトリ。"""
+    """1回の next（か verify）が扱う、1つのプランの作業ディレクトリ。
 
-    def __init__(self, plan_arg):
+    readonly（verify と、#7 の report の計算）のときは何も書かない: nodes.jsonl を消さず、jobs/round.json を作らず、
+    周の印の合わない段を消さずに「作られていない」とみなす。
+    """
+
+    def __init__(self, plan_arg, readonly=False):
+        self.readonly = readonly
         self.plan = Path(plan_arg)
         pace_dir, self.work = workdir_for(self.plan)
         self.jobs_dir = self.work / "jobs"
@@ -1061,7 +1315,7 @@ class Round:
         # プランを読むより先に消す
         nodes_path = self.work / "nodes.jsonl"
         try:
-            if os.path.lexists(str(nodes_path)):
+            if not readonly and os.path.lexists(str(nodes_path)):
                 os.unlink(str(nodes_path))
         except OSError as e:
             raise PaceError("%s を消せませんでした（%s）" % (nodes_path, e.strerror or e))
@@ -1094,10 +1348,22 @@ class Round:
         source = self.work / "source.json"
         self.plan_file = load_work_json(source)["plan_file"] if os.path.lexists(str(source)) else self.plan.name
         self.agent_sha = {}
-        # 同じ next の中で使い回すもの（ノード・根拠付けの入力・ノードの 2-gram）。答えを取り込んだら作り直す
+        # 同じ next の中で使い回すもの（ノード・根拠付けの入力・ノードの 2-gram）。答えを取り込んだら作り直す。
+        # 根拠付けの入力は (r1/r2, 決定, 外す決定の集合) で使い回す（失敗の集合に依らない）。r2 の入力は r1 の答えに依るので、
+        # r1 を判定したらその決定の r2 の入力を捨て、r1 の答えが無いあいだはメモしない
         self._nodes = None
         self._link_inputs = {}
         self._vectors = {}
+        self._clear_pass_memos()
+
+    def _clear_pass_memos(self):
+        """回ごとのメモ（答え・成分・失敗の集合・記憶）を捨てる。run の (1) の判定を全部終えたところで1回呼ぶ。"""
+        self._pass_answers = {}
+        self._components = {}
+        self._failed_link = {}
+        self._failed_decycle = {}
+        self._memory = {}
+        self._text_index = None
 
     # --- 鍵とキャッシュ ---------------------------------------------------
 
@@ -1134,6 +1400,7 @@ class Round:
         """キャッシュの答え。無いか、読めないか、形が違えば None（その単位はジョブを作り直し、cache_put が上書きする）。
 
         分類と裁定は {"labels": [...]}、根拠付けは {"answer": {...}} で、根拠付けはいまの入力に照らして確かめ直す。
+        輪を断つ段の答えと記憶は別の形なので、decycle_answer_get と memory_get で読む。
         cache/ は init が残すので、壊れたものに「init を打ち直して」と案内しても直らない。
         """
         path = self.cache_dir / (key + ".json")
@@ -1151,6 +1418,66 @@ class Round:
         make_private_dir(self.cache_dir)
         write_json(self.cache_dir / (key + ".json"), {"labels": labels} if answer is None else {"answer": answer})
 
+    def _read_cache_obj(self, key):
+        path = self.cache_dir / (key + ".json")
+        if not os.path.lexists(str(path)):
+            return None
+        try:
+            return json.loads(read_regular(path).decode("utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return None
+
+    # 輪を断つ段のキャッシュは2つの形を持つ（16節）。鍵の入力の形が違うので、sha256 で取り違えない。
+    # - 答え: cache_key("decycle", {"nodes","edges"}) に {"cuts": [{"from","to","reason"}]}。walk の確かめにだけ使い、
+    #   キャッシュに当たってもジョブは省かない（省くと記憶を書く場面が無くなる）
+    # - 記憶: cache_key("decycle", {"to_plan_text","to_text"}) に {"cuts": [{"from_plan_text","from_text","reason","round","pass"}]}
+
+    def decycle_answer_get(self, decycle_input):
+        """輪を断つ答え。無いか、読めないか、いまの入力に照らして検証に落ちれば None。"""
+        obj = self._read_cache_obj(self.cache_key("decycle", decycle_input))
+        try:
+            return check_decycle(obj["cuts_answer"], decycle_input)
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def decycle_answer_put(self, decycle_input, answer):
+        make_private_dir(self.cache_dir)
+        write_json(self.cache_dir / (self.cache_key("decycle", decycle_input) + ".json"), {"cuts_answer": answer})
+
+    def memory_key(self, node):
+        """切られた側（to）の決定の文（ノードの言い換えと、その単位の原文の組）を鍵にする。"""
+        return self.cache_key("decycle", {"to_plan_text": self.units[self.pos[node["unit"]]]["text"],
+                                          "to_text": node["text"]})
+
+    def memory_get(self, node):
+        """決定の記憶（切った辺の列）。無いか、壊れていれば空（次に書くときに上書きする）。"""
+        if node["id"] in self._memory:
+            return self._memory[node["id"]]
+        obj = self._read_cache_obj(self.memory_key(node))
+        cuts = obj.get("cuts") if isinstance(obj, dict) else None
+        ok = isinstance(cuts, list) and all(
+            isinstance(c, dict) and all(isinstance(c.get(k), str) for k in ("from_plan_text", "from_text", "reason"))
+            and isinstance(c.get("round"), str) and ROUND_ID.fullmatch(c["round"])
+            and type(c.get("pass")) is int and 1 <= c["pass"] <= MAX_DECYCLE for c in cuts)
+        result = [dict(c) for c in cuts] if ok else []
+        self._memory[node["id"]] = result
+        return result
+
+    def memory_add(self, to_node, from_node, reason, rid, k):
+        """記憶に1件足す。from が同じものがあれば、round と pass と理由をいまのものに書き直す（walk の確かめと揃える）。"""
+        cuts = [dict(c) for c in self.memory_get(to_node)]
+        from_texts = (self.units[self.pos[from_node["unit"]]]["text"], from_node["text"])
+        entry = {"from_plan_text": from_texts[0], "from_text": from_texts[1], "reason": reason, "round": rid, "pass": k}
+        for i, c in enumerate(cuts):
+            if (c["from_plan_text"], c["from_text"]) == from_texts:
+                cuts[i] = entry
+                break
+        else:
+            cuts.append(entry)
+        make_private_dir(self.cache_dir)
+        write_json(self.cache_dir / (self.memory_key(to_node) + ".json"), {"cuts": cuts})
+        self._memory[to_node["id"]] = cuts
+
     # --- ジョブ -----------------------------------------------------------
 
     def round_id(self):
@@ -1159,6 +1486,8 @@ class Round:
         if os.path.lexists(str(path)):
             return load_work_json(path, lambda o: isinstance(o, dict) and isinstance(o.get("round"), str)
                                   and ROUND_ID.fullmatch(o["round"]))["round"]
+        if self.readonly:
+            raise PaceError("周の印（%s）がありません。next を DONE まで回してください" % path)
         # 印が無いのに jobs/ があれば、どの周のものか分からないので消す（symlink でないことは __init__ で確かめた）
         if self.jobs_dir.exists():
             shutil.rmtree(str(self.jobs_dir))
@@ -1183,6 +1512,9 @@ class Round:
                                   and all(JOB_ID.fullmatch(j) for j in o["jobs"]))
             if info.get("round") == rid:
                 return info["jobs"]
+        if self.readonly:
+            # 読むだけのときは消さずに「作られていない」とみなす
+            return None
         if d.exists():
             shutil.rmtree(str(d))
         return None
@@ -1201,21 +1533,32 @@ class Round:
         if m is None:  # created() が先に断るので、ここは二重の守り
             raise PaceError("%s の名前の形が違います。init を打ち直してください" % path)
         job = load_work_json(path, lambda o: valid_job(o) and o["stage"] == stage)
+        # 名前は段の名前で始まる（回の番号がディレクトリと違う名前を読まない）
+        named = job_id.startswith(stage + "_")
         if stage_kind(stage) == "link":
             # 根拠付けの入力は、プランとキャッシュから作り直したものと同じでなければならない
             # （ジョブファイルは Edit(**/.pace/**) で書き換えられうるので、検証の照らし先にしない）
-            ok = (m.group(3) is not None and job["input"]["target"]["id"] == m.group(3)
-                  and job["input"] == self.link_input(stage, m.group(3)))
+            d = m.group("decision")
+            ok = (named and d is not None and job["input"]["target"]["id"] == d
+                  and job["input"] == self.link_input(stage, d))
+        elif stage_kind(stage) == "decycle":
+            # 輪を断つ段の入力も、回 k の答えから作り直した成分の列の、連番の成分の入力と同じでなければならない
+            seq = m.group("seq")
+            comps = self.decycle_components(stage_pass(stage)) if named and seq is not None else []
+            i = int(seq) - 1 if seq is not None else -1
+            ok = named and 0 <= i < len(comps) and job["input"] == self.decycle_input(stage_pass(stage), comps[i])
         elif stage == "classify":
             uids = [u["uid"] for u in job["input"]["units"]]
-            ok = m.group(1) is not None and all(u in self.pos for u in uids) and len(set(uids)) == len(uids)
+            ok = (named and m.group("variant") is not None and all(u in self.pos for u in uids)
+                  and len(set(uids)) == len(uids))
         else:
-            ok = m.group(2) is not None and job["input"]["unit"]["uid"] == m.group(2) and m.group(2) in self.pos
+            uid = m.group("uid")
+            ok = named and uid is not None and job["input"]["unit"]["uid"] == uid and uid in self.pos
         if not ok:
             raise PaceError("%s の形が違います。init を打ち直してください" % path)
         job["job_id"] = job_id
         job["out_path"] = str((self.stage_dir(stage) / (job_id + ".out.json")).absolute())
-        job["variant"] = m.group(1) if stage == "classify" else ""
+        job["variant"] = m.group("variant") if stage == "classify" else ""
         return job
 
     def new_job(self, stage, job_id, job_input, variant=None):
@@ -1348,67 +1691,300 @@ class Round:
     def decisions(self):
         return [n for n in self.node_list() if n["kind"] == "decision"]
 
+    def node_by_id(self, node_id):
+        return next((n for n in self.node_list() if n["id"] == node_id), None)
+
+    def exclusions(self, k, decision):
+        """回 k の決定の根拠付けで候補から外す決定（切った辺の記憶。16節）。
+
+        記憶のうち、from の2つの文がいまの決定と同じで、かつ前の周までに切ったもの（round がいまの周の印でない）か、
+        この周の前の回で切ったもの（pass が k より小さい）。同じ文の決定が2つあれば両方を外す。
+        """
+        rid = self.round_id()
+        if self._text_index is None:
+            self._text_index = {}
+            for n in self.decisions():
+                key = (self.units[self.pos[n["unit"]]]["text"], n["text"])
+                self._text_index.setdefault(key, []).append(n["id"])
+        out = set()
+        for c in self.memory_get(decision):
+            if c["round"] != rid or c["pass"] < k:
+                out.update(self._text_index.get((c["from_plan_text"], c["from_text"]), []))
+        out.discard(decision["id"])
+        return frozenset(out)
+
     def link_input(self, stage, decision_id):
-        """根拠付けの入力を、プランとキャッシュから作り直す。作れない（決定が無い・r2 を作らない）ときは None。"""
-        memo_key = (stage, decision_id)
-        if memo_key in self._link_inputs:
-            return self._link_inputs[memo_key]
+        """根拠付けの入力を、プランとキャッシュ（と記憶）から作り直す。作れない（決定が無い・r2 を作らない）ときは None。
+
+        入力は失敗の集合を見ない（16節）。r2 の入力は回 k の r1 のキャッシュの答えだけから作る。
+        """
         nodes = self.node_list()
         decision = next((n for n in nodes if n["id"] == decision_id and n["kind"] == "decision"), None)
+        if decision is None:
+            return None
+        k = stage_pass(stage)
+        excluded = self.exclusions(k, decision)
+        r1_key = ("r1", decision_id, excluded)
+        if r1_key not in self._link_inputs:
+            self._link_inputs[r1_key] = select_candidates(self.units, nodes, decision, excluded)
+        r1 = self._link_inputs[r1_key]
+        if stage.startswith("link_r1_"):
+            return r1
+        r2_key = ("r2", decision_id, excluded)
+        if r2_key in self._link_inputs:
+            return self._link_inputs[r2_key]
+        answer = self.cache_get(self.link_key(r1), r1)
+        if answer is None:
+            # r1 の答えが無いあいだはメモしない（同じ next の中で r1 の答えが書かれうる）
+            return None
         result = None
-        if decision is not None:
-            r1 = select_candidates(self.units, nodes, decision)
-            if stage == "link_r1":
-                result = r1
-            else:
-                answer = self.cache_get(self.link_key(r1), r1)
-                if answer is not None and answer["need"]:
-                    result = expand_candidates(self.units, nodes, decision, r1, answer, self._vectors)
-        self._link_inputs[memo_key] = result
+        if answer["need"]:
+            result = expand_candidates(self.units, nodes, decision, r1, answer, self._vectors, excluded)
+        self._link_inputs[r2_key] = result
         return result
 
+    def r2_dropped(self, k, decision):
+        """字数で r2 を作れなかった決定か（足す候補はあったが、40,000字で全部削った）。"""
+        r1 = self.link_input("link_r1_%d" % k, decision["id"])
+        answer = self.cache_get(self.link_key(r1), r1)
+        if answer is None or not answer["need"] or self.link_input("link_r2_%d" % k, decision["id"]) is not None:
+            return False
+        return bool(pick_additions(self.units, self.node_list(), decision, r1, answer, self._vectors,
+                                   self.exclusions(k, decision)))
+
+    def failed_link(self, k):
+        """F_link(k): 回 k までに根拠付けのジョブが失敗した決定（作られた段の status と、作り直した入力から辿る）。"""
+        if k not in self._failed_link:
+            rid = self.round_id()
+            out = set()
+            for j in range(1, k + 1):
+                for r in ("link_r1", "link_r2"):
+                    stage = "%s_%d" % (r, j)
+                    for job_id in self.created(stage, rid) or []:
+                        job = self.load_job(stage, job_id)
+                        if job["status"] == "failed":
+                            out.add(job["input"]["target"]["id"])
+            self._failed_link[k] = frozenset(out)
+        return self._failed_link[k]
+
+    def failed_decycle(self, k):
+        """F_dec(<k): 回 k より前の輪を断つ段で、失敗したジョブの成分の決定。"""
+        if k not in self._failed_decycle:
+            rid = self.round_id()
+            out = set()
+            for j in range(1, min(k, MAX_DECYCLE + 1)):
+                stage = "decycle_%d" % j
+                for job_id in self.created(stage, rid) or []:
+                    job = self.load_job(stage, job_id)
+                    if job["status"] == "failed":
+                        out.update(n["id"] for n in job["input"]["nodes"])
+            self._failed_decycle[k] = frozenset(out)
+        return self._failed_decycle[k]
+
+    def pass_answers(self, k):
+        """回 k の答え {決定: 答えか None}。F_link(k) の決定は、キャッシュに当たっても答え無しとする。
+
+        r2 を作った決定は r2 の答え、作らなかった決定は r1 の答え（r2 だけが失敗した決定も r1 で代えない）。
+        """
+        if k not in self._pass_answers:
+            failed = self.failed_link(k)
+            out = {}
+            for d in self.decisions():
+                if d["id"] in failed:
+                    out[d["id"]] = None
+                    continue
+                answer = None
+                for stage in ("link_r2_%d" % k, "link_r1_%d" % k):
+                    job_input = self.link_input(stage, d["id"])
+                    if job_input is not None:
+                        answer = self.cache_get(self.link_key(job_input), job_input)
+                        break
+                out[d["id"]] = answer
+            self._pass_answers[k] = out
+        return self._pass_answers[k]
+
+    def pass_edges(self, k):
+        """回 k の決定どうしの辺 {(from, to): [warrant, …]}。to の答えの step の from に入った決定から張る。"""
+        ids = {d["id"] for d in self.decisions()}
+        edges = {}
+        for to, answer in self.pass_answers(k).items():
+            if answer is None:
+                continue
+            for step in answer["steps"]:
+                for f in step["from"]:
+                    if f in ids and f != to:
+                        edges.setdefault((f, to), [])
+                        if step["warrant"] not in edges[(f, to)]:
+                            edges[(f, to)].append(step["warrant"])
+        return edges
+
+    def pass_components(self, k):
+        """回 k の答えの2ノード以上の強連結成分（輪）。"""
+        if k not in self._components:
+            self._components[k] = strong_components([d["id"] for d in self.decisions()], list(self.pass_edges(k)))
+        return self._components[k]
+
+    def decycle_components(self, k):
+        """回 k の輪を断つジョブにする成分（F_dec(<k) の決定を1つも含まない成分）。"""
+        failed = self.failed_decycle(k)
+        return [c for c in self.pass_components(k) if not set(c) & failed]
+
+    def decycle_input(self, k, comp):
+        nodes = {n["id"]: n for n in self.decisions()}
+        order = {d: i for i, d in enumerate(comp)}
+        edges = sorted(((f, t), w) for (f, t), w in self.pass_edges(k).items() if f in order and t in order)
+        edges.sort(key=lambda e: (order[e[0][0]], order[e[0][1]]))
+        return {"nodes": [{"id": d, "text": nodes[d]["text"], "plan_text": self.units[self.pos[nodes[d]["unit"]]]["text"]}
+                          for d in comp],
+                "edges": [{"from": f, "to": t, "warrants": w} for (f, t), w in edges]}
+
     def make_link(self, stage, rid):
-        """決定ごとに、キャッシュに答えの無いものだけ根拠付けのジョブを作る（r2 は追加の候補がある決定だけ）。"""
+        """決定ごとに、キャッシュに答えの無いものだけ根拠付けのジョブを作る（r2 は追加の候補がある決定だけ）。
+
+        この周の前の回で根拠付けが失敗した決定（F_link(k-1)）には作らない（入力が変わっても出し直さない）。
+        """
+        failed = self.failed_link(stage_pass(stage) - 1)
         jobs = []
         for d in self.decisions():
+            if d["id"] in failed:
+                continue
             job_input = self.link_input(stage, d["id"])
             if job_input is None or self.cache_get(self.link_key(job_input), job_input) is not None:
                 continue
             jobs.append(self.new_job(stage, "%s_%s_%s" % (stage, d["id"], rid), job_input))
         return jobs
 
-    def check_link_coverage(self):
-        """DONE の前に、どの決定にも r1 の答え（r2 を作る決定は r2 の答え）か、失敗したジョブがあるかを確かめる。"""
-        rid = self.round_id()
-        failed = set()
-        for stage in ("link_r1", "link_r2"):
-            for job_id in self.created(stage, rid) or []:
-                job = self.load_job(stage, job_id)
-                if job["status"] == "failed":
-                    failed.add(job["input"]["target"]["id"])
-        for d in self.decisions():
-            if d["id"] in failed:
-                continue
-            for stage in ("link_r1", "link_r2"):
-                job_input = self.link_input(stage, d["id"])
-                if job_input is None:
-                    if stage == "link_r1":
-                        raise PaceError("決定 %s の根拠付けの入力を作れません。init を打ち直してください" % d["id"])
-                    continue
-                if self.cache_get(self.link_key(job_input), job_input) is None:
-                    raise PaceError("決定 %s の根拠付けの答えがありません。init を打ち直してください" % d["id"])
+    def make_decycle(self, stage, rid):
+        k = stage_pass(stage)
+        return [self.new_job(stage, "%s_%03d_%s" % (stage, i, rid), self.decycle_input(k, comp))
+                for i, comp in enumerate(self.decycle_components(k), start=1)]
 
-    def link_answer(self, decision_id):
-        """決定の根拠付けの答え（r2 を作った決定は r2、無ければ r1）。無ければ None。後の段とテストが使う。
+    def check_pass(self, k):
+        """回 k の網羅: どの決定にも回 k の答えか F_link(k) の失敗があるか。無ければ 1 で終わる。"""
+        failed = self.failed_link(k)
+        for d, answer in self.pass_answers(k).items():
+            if answer is None and d not in failed:
+                raise PaceError("決定 %s の回 %d の根拠付けの答えがありません。init を打ち直してください" % (d, k))
 
-        Round を作ると nodes.jsonl を消し（__init__）、ノードを作り直す途中で jobs/round.json が無ければ周の印を決めて書く
-        （failed_units → round_id）。next の外から呼ぶ段は、それを踏まえて作る。
+    def check_decycle_stage(self, k, ids, rid):
+        """作られた decycle_k の列を作り直した成分の列と丸ごと比べ、done のジョブの痕跡（答えのキャッシュと記憶）を確かめる。
+
+        decycle_6 の無い回6でも、記憶の消失と失敗したジョブの status の書き換えを見つけるため（16節）。
         """
-        for stage in ("link_r2", "link_r1"):
-            job_input = self.link_input(stage, decision_id)
-            if job_input is not None:
-                return self.cache_get(self.link_key(job_input), job_input)
-        return None
+        stage = "decycle_%d" % k
+        want = ["%s_%03d_%s" % (stage, i, rid) for i in range(1, len(self.decycle_components(k)) + 1)]
+        if list(ids) != want:
+            raise PaceError("%s の輪を断つジョブの列が、作り直した輪と違います（記憶が消えたか、書き換えられました）。"
+                            "init を打ち直してください" % self.stage_dir(stage))
+        nodes = {n["id"]: n for n in self.decisions()}
+        for job_id in ids:
+            job = self.load_job(stage, job_id)
+            if job["status"] != "done":
+                continue
+            answer = self.decycle_answer_get(job["input"])
+            ok = answer is not None
+            for cut in (answer or {"cuts": []})["cuts"]:
+                to, fr = nodes[cut["to"]], nodes[cut["from"]]
+                texts = (self.units[self.pos[fr["unit"]]]["text"], fr["text"])
+                if not any((c["from_plan_text"], c["from_text"]) == texts and c["round"] == rid and c["pass"] == k
+                           for c in self.memory_get(to)):
+                    ok = False
+            if not ok:
+                raise PaceError("%s の答えか切った辺の記憶がありません（消えたか、書き換えられました）。"
+                                "init を打ち直してください" % self.job_path(stage, job_id))
+
+    def final_pass(self):
+        """終わった回 K。next が DONE まで進んでいなければ 1 で終わる（読むだけ。何も作らない）。"""
+        return self.walk(self.round_id(), create=False)[1]
+
+    def link_answer(self, decision_id, k=None):
+        """決定の回 k（省けば終わった回 K）の根拠付けの答え。無ければ None。後の段とテストが使う。"""
+        if k is None:
+            k = self.final_pass()
+        return self.pass_answers(k).get(decision_id)
+
+    # --- 結合と検証 ---------------------------------------------------------
+
+    def affected(self, k):
+        """U（影響を受けうる決定）と、ノードの無い単位（分類か裁定が失敗した単位）を返す（16節）。
+
+        - 根拠付けが失敗した決定（F_link(K)）
+        - 回 K の2ノード以上の成分のうち、輪を断つ段が失敗した決定を1つでも含む成分の決定
+        - 失敗した単位を候補の規則の範囲に持つ決定
+        - 字数で r2 を作れなかった決定（足す候補はあったが全部削った）
+        """
+        u = set(self.failed_link(k))
+        failed_dec = self.failed_decycle(MAX_DECYCLE + 1)
+        for comp in self.pass_components(k):
+            if set(comp) & failed_dec:
+                u.update(comp)
+        failed_units = self.failed_units()
+        failed_pos = [i for i, unit in enumerate(self.units) if unit["id"] in failed_units]
+        for d in self.decisions():
+            if failed_pos:
+                hit = candidate_rule(self.units, self.pos[d["unit"]])
+                if any(hit(i) for i in failed_pos):
+                    u.add(d["id"])
+            if d["id"] not in u and self.r2_dropped(k, d):
+                u.add(d["id"])
+        return u, [unit["id"] for unit in self.units if unit["id"] in failed_units]
+
+    def analyze(self):
+        """next が DONE まで進んだ作業ディレクトリから、結合したグラフの根への到達と gap の効きを計算する（verify と #7 の report）。
+
+        walk と同じ確かめ（網羅・輪を断つ段の列と痕跡）を通ってから計算する。外れれば 1 で終わる。
+        """
+        k = self.final_pass()
+        decisions = self.decisions()
+        ids = [d["id"] for d in decisions]
+        premises = frozenset(n["id"] for n in self.node_list() if n["kind"] == "premise")
+        answers = self.pass_answers(k)
+        u, units = self.affected(k)
+        optimistic = strengths(ids, answers, {d: ROOTED for d in u}, premises)
+        pessimistic = strengths(ids, answers, None, premises)
+        status = {}
+        for d in ids:
+            if optimistic[d] == ROOTED and pessimistic[d] < ROOTED:
+                status[d] = "unverified"
+            else:
+                # 楽観は悲観より弱くならない。楽観でも届かない決定は、いまの答えのままでは失敗に依らず届かない
+                status[d] = STATUS_NAMES[optimistic[d]]
+        local = {}
+        for d in ids:
+            if status[d] == "unverified":
+                continue
+            fixed = {o: ROOTED for o in ids if o != d}
+            local[d] = strengths(ids, answers, fixed, premises)[d] == ROOTED
+        lev = leverage(ids, answers, status)
+        gaps = []
+        for d in ids:
+            answer = answers.get(d)
+            for g in (answer["gaps"] if answer else []):
+                gaps.append({"id": "G_%s_%s" % (d, g["id"]), "ptype": g["ptype"],
+                             "uncertain": status[d] == "unverified", "leverage": lev.get((d, g["id"]), 0)})
+        cycles = [c for c in self.pass_components(k) if not set(c) & u]
+        return {"pass": k, "decisions": ids, "status": status, "local": local, "gaps": gaps, "cycles": cycles,
+                "unverified_units": units}
+
+    def verify_lines(self):
+        a = self.analyze()
+        counts = {name: sum(1 for s in a["status"].values() if s == name)
+                  for name in ("rooted", "needs_gap", "ungrounded", "unverified")}
+        certain = [g for g in a["gaps"] if not g["uncertain"]]
+        lines = ["VERIFY decisions=%d rooted=%d needs_gap=%d ungrounded=%d unverified=%d local=%d cycles=%d gaps=%d "
+                 "uncertain=%d unverified_units=%d"
+                 % (len(a["decisions"]), counts["rooted"], counts["needs_gap"], counts["ungrounded"],
+                    counts["unverified"], sum(1 for v in a["local"].values() if v), len(a["cycles"]), len(certain),
+                    len(a["gaps"]) - len(certain), len(a["unverified_units"]))]
+        lines += ["CYCLE " + " ".join(c) for c in a["cycles"]]
+        lines += ["DECISION %s %s%s" % (d, a["status"][d], " local" if a["local"].get(d) else "")
+                  for d in a["decisions"]]
+        lines += ["GAP %s %s leverage=%d" % (g["id"], g["ptype"], g["leverage"])
+                  for g in sorted(certain, key=lambda g: (-g["leverage"], g["id"]))]
+        lines += ["GAP %s %s uncertain" % (g["id"], g["ptype"])
+                  for g in sorted((g for g in a["gaps"] if g["uncertain"]), key=lambda g: g["id"])]
+        lines += ["UNIT %s unverified" % uid for uid in a["unverified_units"]]
+        return lines
 
     # --- 判定 -------------------------------------------------------------
 
@@ -1428,6 +2004,9 @@ class Round:
                 if stage_kind(stage) == "link":
                     # load_job が、ジョブの入力をプランとキャッシュから作り直したものと同じと確かめてある
                     result = check_link(answer, job["input"])
+                elif stage_kind(stage) == "decycle":
+                    # load_job が、入力を回 k の答えから作り直した成分の入力と同じと確かめてある
+                    result = check_decycle(answer, job["input"])
                 elif stage == "classify":
                     result = check_classify(answer, job)
                 else:
@@ -1440,8 +2019,17 @@ class Round:
             # 鍵はジョブファイルから読まず、プランから分け直した単位とキャッシュから作り直す（外を指させない）
             if stage_kind(stage) == "link":
                 self.cache_put(self.link_key(job["input"]), answer=result)
-                # r2 の入力は r1 の答えから作るので、作り直させる
-                self._link_inputs.pop(("link_r2", job["input"]["target"]["id"]), None)
+                # r2 の入力は r1 の答えから作るので、その決定の r2 の入力を作り直させる
+                d = job["input"]["target"]["id"]
+                for key in [key for key in self._link_inputs if key[0] == "r2" and key[1] == d]:
+                    del self._link_inputs[key]
+            elif stage_kind(stage) == "decycle":
+                # 答えのキャッシュ → 記憶 → done の順に書く（間で落ちても、次の next が同じ答えを検証し直して書き直す）
+                self.decycle_answer_put(job["input"], result)
+                k = stage_pass(stage)
+                rid = self.round_id()
+                for cut in result["cuts"]:
+                    self.memory_add(self.node_by_id(cut["to"]), self.node_by_id(cut["from"]), cut["reason"], rid, k)
             elif stage == "classify":
                 self._nodes = None
                 for uid, labels in result.items():
@@ -1469,10 +2057,13 @@ class Round:
         if n > MAX_RETRIES:
             # 人間が理由を読むための記録を書き足してから failed にする（数えるのはジョブの status）。
             # 1行1件の JSON は ensure_ascii で書く（U+2028 などで行が割れないように）
-            # units は「ノードの無い単位」。根拠付けの失敗ではノードを消さないので空にし、決定を decision に書く
+            # units は「ノードの無い単位」。根拠付けの失敗ではノードを消さないので空にし、決定を decision に書く。
+            # 輪を断つ段の失敗は、成分の決定（複数）を decisions に書く
             rec = {"job_id": job["job_id"], "stage": stage}
             if stage_kind(stage) == "link":
                 rec.update({"units": [], "decision": job["input"]["target"]["id"]})
+            elif stage_kind(stage) == "decycle":
+                rec.update({"units": [], "decisions": [n["id"] for n in job["input"]["nodes"]]})
             else:
                 rec["units"] = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
                                 else [job["input"]["unit"]["uid"]])
@@ -1565,23 +2156,25 @@ class Round:
                 result.append(node)
         return result
 
-    def run(self):
-        rid = self.round_id()
-        # (1) issued のジョブだけを判定する
-        for stage in JOB_STAGES:
-            ids = self.created(stage, rid)
-            for job_id in ids or []:
-                job = self.load_job(stage, job_id)
-                if job.get("status") == "issued":
-                    self.judge(job)
-        # (2) 段を前から順に見る。ジョブが残っている段で止める
+    def walk(self, rid, create=True):
+        """段を前から順に見る。ジョブが残っている段で止め、("emit", 行) を返す。終わった回 K まで通れば ("done", K)。
+
+        create が偽（読むだけ）なら段を作らず、作られていない段かジョブの残る段があれば 1 で終わる。
+        decycle_k を通るたびに、回 k の網羅と、作られた輪を断つ段の列と痕跡を確かめる（16節）。
+        decycle_k にジョブが無ければ、そこで終える（K=k。後の段は作らない）。
+        """
         for stage in JOB_STAGES:
             ids = self.created(stage, rid)
             if ids is None:
+                if not create:
+                    raise PaceError("段 %s がまだありません。next を DONE まで回してください" % stage)
                 if stage == "classify":
                     jobs = self.make_classify(rid)
                 elif stage == "adjudicate":
                     jobs = self.make_adjudicate(rid)
+                elif stage_kind(stage) == "decycle":
+                    self.check_pass(stage_pass(stage))
+                    jobs = self.make_decycle(stage, rid)
                 else:
                     jobs = self.make_link(stage, rid)
                 ids = self.write_stage(stage, rid, jobs)
@@ -1593,14 +2186,39 @@ class Round:
                     pending.append(job)
                 elif job.get("status") == "issued":
                     waiting = True
+            if (pending or waiting) and not create:
+                raise PaceError("段 %s にジョブが残っています。next を DONE まで回してください" % stage)
             if pending:
-                return self.emit(stage, pending)
+                return "emit", self.emit(stage, pending)
             if waiting:
                 # 出したジョブの答えを待っている（判定のあとなので、ここには来ない見込み）
                 raise PaceError("答えを待っているジョブがあります。束を subagent に渡してから打ってください")
-        # (3) 全部の段を通った。網羅（ノードと根拠付け）を確かめてノードを書く
+            if stage_kind(stage) == "decycle":
+                k = stage_pass(stage)
+                self.check_pass(k)
+                self.check_decycle_stage(k, ids, rid)
+                if not ids:
+                    return "done", k
+        self.check_pass(PASSES)
+        return "done", PASSES
+
+    def run(self):
+        rid = self.round_id()
+        # (1) 判定: issued のジョブだけを判定する
+        for stage in JOB_STAGES:
+            ids = self.created(stage, rid)
+            for job_id in ids or []:
+                job = self.load_job(stage, job_id)
+                if job.get("status") == "issued":
+                    self.judge(job)
+        # 判定で増えた失敗と記憶を、後の段を作るときに見落とさないよう、回ごとのメモを1回だけ捨てる
+        self._clear_pass_memos()
+        # (2) 段を作る: 段を前から順に見る。ジョブが残っている段で止める
+        kind, value = self.walk(rid)
+        if kind == "emit":
+            return value
+        # (3) 終わった回 K まで通った（網羅は walk が確かめた）。ノードを書く
         nodes = self.node_list()
-        self.check_link_coverage()
         write_atomic(self.work / "nodes.jsonl",
                      "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in nodes).encode("utf-8"),
                      PRIVATE_FILE)
@@ -1608,7 +2226,6 @@ class Round:
         decisions = sum(1 for n in nodes if n["kind"] == "decision")
         return ["DONE decisions=%d premises=%d failed_jobs=%d"
                 % (decisions, len(nodes) - decisions, len(self.failed_jobs()))]
-
 
 def next_(plan_arg):
     try:
@@ -1625,6 +2242,20 @@ def next_(plan_arg):
     return 0
 
 
+def verify_(plan_arg):
+    try:
+        lines = Round(plan_arg, readonly=True).verify_lines()
+    except OSError as e:
+        raise PaceError("作業ディレクトリを読めませんでした（%s）: %s" % (e.strerror or e, e.filename or plan_arg))
+    except RecursionError:
+        raise PaceError("作業ディレクトリのファイルの入れ子が深すぎます。init を打ち直してください")
+    try:
+        sys.stdout.write("".join(line + "\n" for line in lines))
+    except UnicodeEncodeError:
+        raise PaceError("出力を UTF-8 で表せません")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pace.py", description="PACE の機械の仕事を受け持つ")
     parser.add_argument("--version", action="store_true", help="段ごとの版の一覧を出す")
@@ -1633,12 +2264,14 @@ def main(argv=None):
     p_init.add_argument("plan", help="プランのパス")
     p_next = sub.add_parser("next", help="前の波の答えを取り込み、次の波の束を出す")
     p_next.add_argument("plan", help="プランのパス")
+    p_verify = sub.add_parser("verify", help="DONE まで進んだ作業ディレクトリを書き換えずに読み、根への到達と gap の効きを出す")
+    p_verify.add_argument("plan", help="プランのパス")
     args = parser.parse_args(argv)
     if args.version:
         for name, version in STAGE_VERSIONS:
             print(f"{name} {version}")
         return 0
-    commands = {"init": init, "next": next_}
+    commands = {"init": init, "next": next_, "verify": verify_}
     if args.command in commands:
         try:
             return commands[args.command](args.plan)
