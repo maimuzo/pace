@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """PACE の機械の仕事を受け持つスクリプト。
 
-いまは --version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）と
+--version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）と
 next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化と、
-候補の絞り込み・根拠付け r1・2-gram の追加候補・根拠付け r2・輪を断つ反復まで）と
-verify（next が DONE まで進んだ作業ディレクトリを書き換えずに読み、結合したグラフの根への到達と gap の効きを出す）を持つ。
-report・show・shown は後の issue（maimuzo/pace#7）で足す。
+候補の絞り込み・根拠付け r1・2-gram の追加候補・根拠付け r2・輪を断つ反復・反論まで）と
+verify（終わった回 K まで進んだ作業ディレクトリを書き換えずに読み、結合したグラフの根への到達と gap の効きを出す。
+反論の段は見ない）と report（直すものと訊くものに分けて書き、周を続けるかを出す）と
+show・shown（人間に見せる show.md と写しを書き、見せた写しを差分の基準にする）を持つ。
 Python 3.9 以上・標準ライブラリだけで動かす。分割と作業ディレクトリの決まりは
 docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは14節（ジョブと束）、
-根拠付けの決まりは15節（根拠付け）、輪を断つ反復と結合の決まりは16節にある。
+根拠付けの決まりは15節（根拠付け）、輪を断つ反復と結合の決まりは16節、反論の段は17節、report は18節、
+show と shown は21節、周の回し方（NEXT の条件）は7節にある。
 """
 
 import argparse
 import bisect
+import difflib
 import errno
 import hashlib
 import json
@@ -32,7 +35,7 @@ STAGE_VERSIONS = (
     ("adjudicate", "2026-10-16.1"),
     ("link", "2026-10-17.1"),
     ("decycle", "2026-10-17.1"),
-    ("review", "2026-10-16.1"),
+    ("review", "2026-10-17.1"),
 )
 
 # init が作り直さずに残すもの（作業ディレクトリの直下の名前）。
@@ -595,7 +598,13 @@ MAX_DECYCLE = 5
 PASSES = MAX_DECYCLE + 1
 
 AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
-STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge", "link": "pace-worker", "decycle": "pace-judge"}
+STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge", "link": "pace-worker", "decycle": "pace-judge",
+               "review": "pace-judge"}
+# 反論の段（17節）。回を持たない1つの段で、終わった回 K の答えを審査する。JOB_STAGES には入れない（並びと末尾
+# link_r2_6 を前提にする walk・run・テストを動かさないため）。DONE はこの段のあとに出る
+REVIEW_STAGE = "review"
+DEFEATER_TYPES = ("logic", "missing", "fact", "value")
+DEFEATER_STATUSES = ("refuted", "accepted", "needs_human")
 
 
 def _job_stages():
@@ -673,6 +682,18 @@ input.nodes は輪の中の決定、input.edges は「from の決定を理由に
 切った後に輪が1つも残らないようにすること（スクリプトが検査する）。切る辺はできるだけ少なくし、それぞれ理由を書く。
 出力は JSON: {"cuts":[{"from":"...","to":"...","reason":"..."}]}
 nodes の plan_text はプランの原文である。""",
+    # docs/idea.md 付録A の [review] の全文のうち、2文目（ほかの決定の扱い）・refuted の文・target の文・出力の形を
+    # 書き換え（反証の根拠を前提に限り、by_quotes を外す。17節）、入力の形の説明4文を足したもの
+    "review": """あなたは敵対的なレビュー担当である。input.target の決定は、input.steps の推論（steps の from に出る input.nodes）でプランの前提まで根拠がつながったとされている。本当に成り立つかを疑い、反論を出せ。甘い評価は不要。反論が無ければ空でよい。
+target 以外の decision は別のジョブで審査されるので、反論の target にも、反証の根拠にもしない。審査するのは target に至る推論である。
+観点: logic（前提から結論が本当に導けるか、別案を本当に退けているか）/ missing（プランに無い前提を暗黙に使っていないか）/ fact（前提の事実が結論を支えるのに十分か）/ value（人間が重視するもの次第で答えが変わる判断を黙って決めていないか）。
+各反論は自分で処理まで行う: refuted（input.nodes の前提（kind が fact・requirement・value）で反証できる。by にその前提の id を1つ以上挙げる。反論の target の前提と、同じ答えのほかの反論が target にしている前提は挙げない）/ accepted（反論が正しい。プランの修正が要る）/ needs_human（人間の価値判断が要る）。
+target には input.target.id か、input.steps の id か、input.steps の from に出る input.nodes の id（kind が decision のものを除く）を書く。
+出力は JSON: {"defeaters":[{"target":"...","type":"logic","text":"...","status":"accepted","by":[],"note":"..."}]}
+steps の id は s1, s2, … で、nodes の kind は decision・fact・requirement・value・claim である。
+plan_text はプランの原文である。
+決定そのものへの反論は、target に input.target.id を書く。
+accepted と needs_human の by は空にする。""",
 }
 
 
@@ -722,13 +743,13 @@ def valid_job(obj):
     （job_id・out_path・cache_key・variant）はファイルから使わない。load_job と judge が、created.json の列の ID と
     プランから分け直した単位で作り直す（作業ディレクトリの外を指させない）。uid が単位にあるかは load_job が見る。
     """
-    if not (isinstance(obj, dict) and obj.get("stage") in JOB_STAGES
+    if not (isinstance(obj, dict) and (obj.get("stage") in JOB_STAGES or obj.get("stage") == REVIEW_STAGE)
             and type(obj.get("attempts")) is int and 0 <= obj["attempts"] <= MAX_RETRIES + 1
             and is_str_list(obj.get("previous_errors")) and all(encodable(e) for e in obj["previous_errors"])
             and isinstance(obj.get("input"), dict)
             and obj.get("status") in ("pending", "issued", "done", "failed")):
         return False
-    if stage_kind(obj["stage"]) == "link":
+    if stage_kind(obj["stage"]) in ("link", REVIEW_STAGE):
         # 入力そのものは load_job が、プランとキャッシュから作り直したものと突き合わせる
         target = obj["input"].get("target")
         return isinstance(target, dict) and isinstance(target.get("id"), str)
@@ -756,7 +777,9 @@ def encodable(text):
 ROUND_ID = re.compile(r"[0-9a-f]{8}")
 JOB_ID = re.compile(r"(?:classify_(?P<variant>[AB])_[0-9]{3,}|adjudicate_(?P<uid>u[0-9a-f]{8}(?:_[0-9]+)?)"
                     r"|link_r[12]_[1-9]_(?P<decision>D_[0-9a-f]{8}(?:_[0-9]+)?_[0-9]+)"
-                    r"|decycle_[1-9]_(?P<seq>[0-9]{3,}))_[0-9a-f]{8}")
+                    r"|decycle_[1-9]_(?P<seq>[0-9]{3,})"
+                    # 反論の段の名前付きグループは、根拠付けの decision と名前を重ねない（re は同じ名前を2回使えない）
+                    r"|review_(?P<review_decision>D_[0-9a-f]{8}(?:_[0-9]+)?_[0-9]+))_[0-9a-f]{8}")
 
 # 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
 ERROR_MAX_CHARS = 300
@@ -992,6 +1015,71 @@ def check_decycle(answer, decycle_input):
     if left:
         raise ValueError("切ったあとも輪が残ります: %s" % " ".join(left[0]))
     return {"cuts": out}
+
+
+def check_review(answer, review_input):
+    """反論の答えを、作り直した入力に照らして確かめ、知らないキーを捨てたものを返す。誤りは ValueError（17節）。
+
+    refuted の根拠（by）は入力の前提だけにする。claim・step・ほかの決定の強さは反論の target から来うるので、
+    根拠にすると自分を理由にした循環になりうる。前提はプランの原文で強さを誰からも受けないので、検証を通った
+    refuted は必ず根に届く。反論の target の前提と、同じ答えのどの反論の target の前提も根拠にしない
+    （refuted どうしが互いの target を根拠にし合う持ち合いも断つ）。idea.md の by_quotes は受けない（知らないキーとして捨てる）。
+    """
+    if not isinstance(answer, dict):
+        raise ValueError("答えが JSON のオブジェクトではありません")
+    items = answer.get("defeaters")
+    if not isinstance(items, list):
+        raise ValueError('"defeaters" が配列ではありません')
+    nodes = {n["id"]: n for n in review_input["nodes"]}
+    premises = {i for i, n in nodes.items() if n["kind"] in PTYPES}
+    step_ids = {s["id"] for s in review_input["steps"]}
+    in_steps = {f for s in review_input["steps"] for f in s["from"]}
+    # target にできるのは、審査する決定・step・claim と、推論で使った前提（候補として足しただけの前提は by にだけ使う）
+    targets = ({review_input["target"]["id"]} | step_ids | {i for i, n in nodes.items() if n["kind"] == "claim"}
+               | (premises & in_steps))
+    parsed = []
+    for k, item in enumerate(items, start=1):
+        where = "defeaters の %d 件目" % k
+        if not isinstance(item, dict):
+            raise ValueError("%s がオブジェクトではありません" % where)
+        # 型を先に確かめる（配列やオブジェクトを set に照らすと TypeError で next が落ち、差し戻せなくなる）
+        for key in ("target", "type", "status"):
+            if not isinstance(item.get(key), str):
+                raise ValueError("%s の %s が文字列ではありません" % (where, key))
+        by = item.get("by", [])
+        if not isinstance(by, list) or not all(isinstance(b, str) for b in by):
+            raise ValueError("%s の by が文字列の配列ではありません" % where)
+        note = item.get("note", "")
+        if not isinstance(note, str) or not encodable(note):
+            raise ValueError("%s の note が文字列ではありません（UTF-8 で書けない字も含めない）" % where)
+        if item["target"] not in targets:
+            raise ValueError("%s の target が、input.target.id・steps の id・claims の id・steps の from に出る前提の id の"
+                             "どれでもありません（ほかの決定への反論は出さない）: %r" % (where, item["target"]))
+        if item["type"] not in DEFEATER_TYPES:
+            raise ValueError("%s の type が logic / missing / fact / value のどれでもありません" % where)
+        if item["status"] not in DEFEATER_STATUSES:
+            raise ValueError("%s の status が refuted / accepted / needs_human のどれでもありません" % where)
+        text = nonempty_text(item.get("text"), "%s の text" % where)
+        parsed.append((where, item["target"], item["type"], item["status"], text, list(by), note))
+    attacked = {t for _, t, _, _, _, _, _ in parsed}
+    out = []
+    for where, target, typ, status, text, by, note in parsed:
+        if status == "refuted":
+            if not by:
+                raise ValueError("%s は refuted なのに by が空です（input.nodes の前提の id を1つ以上挙げる）" % where)
+            bad = [b for b in by if b not in premises]
+            if bad:
+                raise ValueError("%s の by に、input.nodes の前提（kind が fact・requirement・value）でない id があります"
+                                 "（claim・step・ほかの決定は根拠にしない）: %s" % (where, ", ".join(repr(b) for b in bad)))
+            self_ref = [b for b in by if b in attacked]
+            if self_ref:
+                raise ValueError("%s の by に、この答えの反論が target にしている前提があります（自分を理由にした循環）: %s"
+                                 % (where, ", ".join(self_ref)))
+        else:
+            # accepted と needs_human は根拠を持たない（書いてあっても捨てる。差し戻さない）
+            by = []
+        out.append({"target": target, "type": typ, "text": text, "status": status, "by": by, "note": note})
+    return {"defeaters": out}
 
 
 # ---------------------------------------------------------------------------
@@ -1289,6 +1377,33 @@ def leverage(decision_ids, answers, status):
     return count
 
 
+def leverage_sets(decision_ids, answers, status):
+    """leverage と同じ辿り方で、gap ごとに止めている決定の集合 {(決定, gap の id): {決定, …}} を返す（report の項目）。
+
+    leverage の数は、この集合の大きさと同じ。leverage はテストが戻り値を丸ごと比べているので、形を変えずに別に置く。
+    """
+    ids = set(decision_ids)
+    out = {}
+    for start in decision_ids:
+        if status[start] != "needs_gap":
+            continue
+        seen = {start}
+        todo = [start]
+        while todo:
+            d = todo.pop()
+            answer = answers.get(d)
+            if answer is None:
+                continue
+            for g in answer["gaps"]:
+                out.setdefault((d, g["id"]), set()).add(start)
+            for step in answer["steps"]:
+                for f in step["from"]:
+                    if f in ids and f not in seen and status.get(f) == "needs_gap":
+                        seen.add(f)
+                        todo.append(f)
+    return out
+
+
 class Round:
     """1回の next（か verify）が扱う、1つのプランの作業ディレクトリ。
 
@@ -1331,6 +1446,8 @@ class Round:
             raise PaceError("%s を読めません（%s）。init を打ち直してください" % (self.work / "plan.md", e))
         if copy != data:
             raise PaceError("プランが init のあとで変わりました。init を打ち直してください: %s" % self.plan)
+        # report の rounds.jsonl の plan_sha256 と show の写しは、このバイト（init の写しと同じと確かめたもの）から取る
+        self.plan_bytes = data
         # 単位は units.jsonl を読まず、プランから分け直す（init と同じ規則なので同じ単位になる）。
         # units.jsonl は Edit(**/.pace/**) で書き換えられうるので、網羅とノードの基準にしない
         self.units = split_units(text)
@@ -1364,6 +1481,10 @@ class Round:
         self._failed_decycle = {}
         self._memory = {}
         self._text_index = None
+        # 反論の段（17節）: analyze の結果（回 K ごと）・終わった回 K・反論の入力（決定ごと）
+        self._analysis = {}
+        self._review_k = None
+        self._review_inputs = {}
 
     # --- 鍵とキャッシュ ---------------------------------------------------
 
@@ -1443,6 +1564,19 @@ class Round:
     def decycle_answer_put(self, decycle_input, answer):
         make_private_dir(self.cache_dir)
         write_json(self.cache_dir / (self.cache_key("decycle", decycle_input) + ".json"), {"cuts_answer": answer})
+
+    def review_answer_get(self, review_input):
+        """反論の答え（{"defeaters": [...]}）。鍵は作り直した入力の全体。無いか、読めないか、いまの入力に照らして
+        検証に落ちれば None（その決定はジョブを作り直す）。"""
+        obj = self._read_cache_obj(self.cache_key(REVIEW_STAGE, review_input))
+        try:
+            return check_review(obj["defeaters_answer"], review_input)
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def review_answer_put(self, review_input, answer):
+        make_private_dir(self.cache_dir)
+        write_json(self.cache_dir / (self.cache_key(REVIEW_STAGE, review_input) + ".json"), {"defeaters_answer": answer})
 
     def memory_key(self, node):
         """切られた側（to）の決定の文（ノードの言い換えと、その単位の原文の組）を鍵にする。"""
@@ -1553,6 +1687,11 @@ class Round:
             comps = self.decycle_components(stage_pass(stage)) if named and seq is not None else []
             i = int(seq) - 1 if seq is not None else -1
             ok = named and 0 <= i < len(comps) and job["input"] == self.decycle_input(stage_pass(stage), comps[i])
+        elif stage == REVIEW_STAGE:
+            # 反論の段の入力も、終わった回 K の答えから作り直したものと同じでなければならない（対象でない決定は None）
+            d = m.group("review_decision")
+            ok = (named and d is not None and job["input"]["target"]["id"] == d
+                  and job["input"] == self.review_input(d))
         elif stage == "classify":
             uids = [u["uid"] for u in job["input"]["units"]]
             ok = (named and m.group("variant") is not None and all(u in self.pos for u in uids)
@@ -1640,7 +1779,7 @@ class Round:
         """
         rid = self.round_id()
         out = []
-        for stage in JOB_STAGES:
+        for stage in JOB_STAGES + (REVIEW_STAGE,):
             for job_id in self.created(stage, rid) or []:
                 job = self.load_job(stage, job_id)
                 if job["status"] == "failed":
@@ -1876,8 +2015,12 @@ class Round:
         """作られた decycle_k の列を作り直した成分の列と丸ごと比べ、done のジョブの痕跡（答えのキャッシュと記憶）を確かめる。
 
         decycle_6 の無い回6でも、いまの周に切った辺の記憶の消失と、失敗したジョブを done に書き換えたことを見つけるため（16節）。
-        前の周に切った辺の記憶の消失と、done を failed に書き換えたことは、作り直した輪か後の回の入力が変わるときだけ
-        （列の比べか load_job で）見つかる。変わらなければ見つけない（突き合わせる痕跡が残らない。10節）。
+        前の周に切った辺の記憶の消失は、作り直した輪か入力が変わるとき（この周に作った回1のジョブの入力を含む）に
+        （列の比べか load_job で）見つかる。done を failed に書き換えると、その成分の決定は F_dec に入って後の回の輪を
+        断つ段の対象から外れる。後の回の輪を断つジョブが既に作られていて、その決定を含むなら、列の比べか load_job で
+        見つかる。作られる前なら反復が早く終わりうり、終わった回 K の輪と重なれば決定は U に入る。どれにも当たらなければ
+        見つけず、failed_jobs だけが増える（突き合わせる痕跡が残らない。10節）。反論の段が作られたあとなら、反論のジョブの
+        ある決定が対象から外れて、next・report・show が 1 で終わりうる（verify は反論の段を見ない）。
         """
         stage = "decycle_%d" % k
         want = ["%s_%03d_%s" % (stage, i, rid) for i in range(1, len(self.decycle_components(k)) + 1)]
@@ -1902,10 +2045,10 @@ class Round:
                                 "init を打ち直してください" % self.job_path(stage, job_id))
 
     def final_pass(self):
-        """終わった回 K。next が DONE まで進んでいなければ 1 で終わる（段は作らない）。
+        """終わった回 K。next が終わった回 K まで進んでいなければ 1 で終わる（段は作らない。反論の段は見ない）。
 
         readonly でない Round では、round_id と created が印の無い jobs/ や印の合わない段を消しうるので、
-        next の外から呼ぶ段（#7 の report など）は readonly の Round を使う。
+        next の外から呼ぶ段（report・show など）は readonly の Round を使う。
         """
         return self.walk(self.round_id(), create=False)[1]
 
@@ -1944,12 +2087,20 @@ class Round:
                 u.add(d["id"])
         return u, [unit["id"] for unit in self.units if unit["id"] in failed_units]
 
-    def analyze(self):
-        """next が DONE まで進んだ作業ディレクトリから、結合したグラフの根への到達と gap の効きを計算する（verify と #7 の report）。
+    def analyze(self, k=None):
+        """終わった回 K まで進んだ作業ディレクトリから、結合したグラフの根への到達と gap の効きを計算する（verify と report）。
 
-        walk と同じ確かめ（網羅・輪を断つ段の列と痕跡）を通ってから計算する。外れれば 1 で終わる。
+        k を省けば、walk と同じ確かめ（網羅・輪を断つ段の列と痕跡）を通って K を決めてから計算する。外れれば 1 で終わる。
+        結果は回ごとに1回だけ計算して置く（反論の段の入力を決定ごとに作るたびに計算し直さない）。
+        U・unverified・uncertain の計算は #6 のまま（16節）。戻り値の "u" は report と反論の段が使う。
         """
-        k = self.final_pass()
+        if k is None:
+            k = self.final_pass()
+        if k not in self._analysis:
+            self._analysis[k] = self._analyze(k)
+        return self._analysis[k]
+
+    def _analyze(self, k):
         decisions = self.decisions()
         ids = [d["id"] for d in decisions]
         premises = frozenset(n["id"] for n in self.node_list() if n["kind"] == "premise")
@@ -1979,7 +2130,197 @@ class Round:
                              "uncertain": status[d] == "unverified", "leverage": lev.get((d, g["id"]), 0)})
         cycles = [c for c in self.pass_components(k) if not set(c) & u]
         return {"pass": k, "decisions": ids, "status": status, "local": local, "gaps": gaps, "cycles": cycles,
-                "unverified_units": units}
+                "unverified_units": units, "u": frozenset(u), "answers": answers}
+
+    # --- 反論（17節） --------------------------------------------------------
+
+    def review_k(self):
+        """反論の段が審査する回 K。終わった回 K まで全部の段が済んでいれば決まる（読むだけの walk）。"""
+        if self._review_k is None:
+            self._review_k = self.final_pass()
+        return self._review_k
+
+    def review_targets(self):
+        """反論にかける決定（決定の順）。unverified でなく、U に入らず、local で、回 K の答えに gap が1つも無いもの。
+
+        pace.py の local は step の強い方を採るので gap を抱えた決定も local になりうる。それをかけると gap を埋めたときに
+        反論もやり直しになり、gap の項目と同じ穴を指す accepted が二重に出るので外す（idea.md:136 の定義に揃える）。
+        """
+        a = self.analyze(self.review_k())
+        out = []
+        for d in a["decisions"]:
+            answer = a["answers"].get(d)
+            if (answer is not None and a["status"][d] != "unverified" and d not in a["u"] and a["local"].get(d)
+                    and not answer["gaps"]):
+                out.append(d)
+        return out
+
+    def review_input(self, decision_id):
+        """反論の入力を、回 K の答えと根拠付けの入力から作り直す。対象でない決定は None。
+
+        nodes は、回 K の答えの claims と、steps の from に出る候補のノードと、回 K の根拠付けの入力の候補（r2 の追加を
+        含む）にある前提のノード（steps には出なくてよい。プランの別の節で答えている反論を、前提で反証できるように）。
+        steps の id は答えの並びの順に s1… と振る。
+        """
+        if decision_id in self._review_inputs:
+            return self._review_inputs[decision_id]
+        result = None
+        if decision_id in self.review_targets():
+            k = self.review_k()
+            decision = self.node_by_id(decision_id)
+            answer = self.analyze(k)["answers"][decision_id]
+            link = self.link_input("link_r2_%d" % k, decision_id) or self.link_input("link_r1_%d" % k, decision_id)
+            plan_text = {}
+            for g in link["candidates"]:
+                for n in g["nodes"]:
+                    plan_text[n["id"]] = g["plan_text"]
+            nodes, seen = [], set()
+
+            def add(node_id):
+                if node_id in seen:
+                    return
+                n = self.node_by_id(node_id)
+                if n is None:
+                    return
+                seen.add(node_id)
+                nodes.append({"id": node_id, "kind": "decision" if n["kind"] == "decision" else n["ptype"],
+                              "text": n["text"], "plan_text": plan_text.get(node_id,
+                                                                            self.units[self.pos[n["unit"]]]["text"])})
+            claim_ids = {c["id"] for c in answer["claims"]}
+            for step in answer["steps"]:
+                for f in step["from"]:
+                    if f not in claim_ids:
+                        add(f)
+            for c in answer["claims"]:
+                nodes.append({"id": c["id"], "kind": "claim", "text": c["text"]})
+            for g in link["candidates"]:
+                for n in g["nodes"]:
+                    if n["kind"] in PTYPES:
+                        add(n["id"])
+            result = {"target": {"id": decision_id, "text": decision["text"],
+                                 "alternatives": decision["alternatives"],
+                                 "plan_text": self.units[self.pos[decision["unit"]]]["text"]},
+                      "nodes": nodes,
+                      "steps": [{"id": "s%d" % i, "from": list(s["from"]), "to": s["to"], "warrant": s["warrant"]}
+                                for i, s in enumerate(answer["steps"], start=1)]}
+        self._review_inputs[decision_id] = result
+        return result
+
+    def make_review(self, rid):
+        """反論にかける決定ごとに、キャッシュに答えの無いものだけジョブを作る（根拠付けと同じく、当たれば作らない）。"""
+        jobs = []
+        for d in self.review_targets():
+            job_input = self.review_input(d)
+            if self.review_answer_get(job_input) is not None:
+                continue
+            jobs.append(self.new_job(REVIEW_STAGE, "%s_%s_%s" % (REVIEW_STAGE, d, rid), job_input))
+        return jobs
+
+    def load_review_job(self, job_id, targets):
+        """反論のジョブを読む。load_job は入力を作り直して比べ、対象でない決定では「形が違います」で止まるので、
+        ID の決定が対象かを先に見る（review_done の (2) と run の (1b)）。"""
+        m = JOB_ID.fullmatch(job_id)
+        if m is None or m.group("review_decision") not in targets:
+            raise PaceError("%s は、いまの反論の対象の決定のものではありません（輪を断つジョブなどが書き換えられました）。"
+                            "init を打ち直してください" % self.job_path(REVIEW_STAGE, job_id))
+        return self.load_job(REVIEW_STAGE, job_id)
+
+    def review_done(self, rid):
+        """反論の段が済んだことを確かめる（run の DONE の前・report・show）。外れれば 1 で終わる。
+
+        (1) 段が作られていて、ジョブが残っていない。(2) 作られた列のどのジョブも、いまの対象の決定のもの（列は対象の部分。
+        当たった決定にはジョブを作らないので、丸ごとは比べない）。(3) どの対象の決定にも、いまの入力で検証し直して通る
+        キャッシュの答えか、列の中の失敗したジョブがある（ジョブの status を先に見る。failed ならキャッシュがあっても失敗）。
+        """
+        ids = self.created(REVIEW_STAGE, rid)
+        if ids is None:
+            raise PaceError("反論の段がまだありません。next を DONE まで回してください")
+        targets = self.review_targets()
+        status = {}
+        for job_id in ids:
+            job = self.load_review_job(job_id, targets)
+            d = job["input"]["target"]["id"]
+            if job["status"] in ("pending", "issued"):
+                raise PaceError("反論の段にジョブが残っています。next を DONE まで回してください")
+            status[d] = job["status"]
+        for d in targets:
+            if status.get(d) == "failed":
+                continue
+            if self.review_answer_get(self.review_input(d)) is None:
+                raise PaceError("決定 %s の反論の答えがありません（消えたか、書き換えられました）。init を打ち直してください" % d)
+        return ids
+
+    # --- 直すものと訊くもの（18節） ------------------------------------------
+
+    def findings(self):
+        """反論の段まで済んだ作業ディレクトリから、fixes・questions・確かめられなかったもの・反論を作る（report と show）。
+
+        項目は gap 1つ（questions の gap だけ、ptype と normalize した本文が同じものを1つにまとめる）・accepted か
+        needs_human の反論1つ・残った輪1つ・根拠の無い決定1つ。U の決定は、悲観でも根に届いて rooted でも、その gap と
+        反論を数えず「確かめられなかったもの」に出す（性質3。U の集合と計算は #6 のまま）。U の外で unverified の決定
+        （楽観で rooted・悲観で届かない。U の決定に頼ってだけ根に届くもの）も、同じく gap と輪を数えずにそこへ出す
+        （その gap は verify で uncertain）。外した輪の ungrounded の決定は、根拠の無い決定として数える。refuted は数えない（根拠は前提に
+        限るので必ず根に届く）。
+        """
+        rid = self.round_id()
+        k = self.review_k()
+        review_ids = self.review_done(rid)
+        a = self.analyze(k)
+        ids = a["decisions"]
+        order = {d: i for i, d in enumerate(ids)}
+        answers, status, u = a["answers"], a["status"], a["u"]
+        # U の外で U を理由にした決定も unverified になる（楽観は U を rooted に固定する）。どちらも失敗に左右されうる
+        unsure = set(u) | {d for d in ids if status[d] == "unverified"}
+        sets = leverage_sets(ids, answers, status)
+        fact_gaps, merged = [], {}
+        for d in ids:
+            answer = answers.get(d)
+            if d in unsure or answer is None:
+                continue
+            for g in answer["gaps"]:
+                blocked = sets.get((d, g["id"]), set())
+                if g["ptype"] == "fact":
+                    fact_gaps.append({"kind": "gap", "ptype": "fact", "text": g["text"], "owners": [d],
+                                      "blocked": set(blocked), "ids": ["G_%s_%s" % (d, g["id"])]})
+                    continue
+                item = merged.setdefault((g["ptype"], normalize(g["text"])),
+                                         {"kind": "gap", "ptype": g["ptype"], "text": g["text"], "owners": [],
+                                          "blocked": set(), "ids": []})
+                if d not in item["owners"]:
+                    item["owners"].append(d)
+                item["blocked"] |= blocked
+                item["ids"].append("G_%s_%s" % (d, g["id"]))
+
+        def by_weight(item):
+            return (-len(item["blocked"]), order[item["owners"][0]])
+        review_status = {}
+        for job_id in review_ids:
+            job = self.load_job(REVIEW_STAGE, job_id)
+            review_status[job["input"]["target"]["id"]] = job["status"]
+        accepted, needs_human, refuted, review_failed = [], [], [], []
+        for d in self.review_targets():
+            if review_status.get(d) == "failed":
+                review_failed.append(d)
+                continue
+            for df in self.review_answer_get(self.review_input(d))["defeaters"]:
+                entry = dict(df, decision=d, kind="defeater")
+                {"accepted": accepted, "needs_human": needs_human, "refuted": refuted}[df["status"]].append(entry)
+        edges = self.pass_edges(k)
+        cycles = [{"kind": "cycle", "decisions": list(c),
+                   "edges": [(f, t, w) for (f, t), w in sorted(edges.items(), key=lambda e: (order[e[0][0]], order[e[0][1]]))
+                             if f in c and t in c]} for c in a["cycles"] if not set(c) & unsure]
+        # 外した輪の ungrounded の決定は、楽観でも届かない（失敗に依らない）ので、根拠の無い決定として残す
+        in_cycle = {d for c in cycles for d in c["decisions"]}
+        ungrounded = [{"kind": "ungrounded", "decision": d} for d in ids
+                      if status[d] == "ungrounded" and d not in in_cycle and d not in unsure]
+        fixes = sorted(fact_gaps, key=by_weight) + accepted + cycles + ungrounded
+        questions = sorted(merged.values(), key=by_weight) + needs_human
+        failed = self.failed_jobs()
+        return {"pass": k, "analysis": a, "fixes": fixes, "questions": questions, "refuted": refuted,
+                "failed_jobs": failed, "u": sorted(u, key=order.get), "review_failed": review_failed,
+                "unverified": [d for d in ids if status[d] == "unverified" and d not in u],
+                "unverified_units": a["unverified_units"], "review_targets": self.review_targets(),
+                "defeaters": {"accepted": len(accepted), "refuted": len(refuted), "needs_human": len(needs_human)}}
 
     def verify_lines(self):
         a = self.analyze()
@@ -2022,6 +2363,9 @@ class Round:
                 elif stage_kind(stage) == "decycle":
                     # load_job が、入力を回 k の答えから作り直した成分の入力と同じと確かめてある
                     result = check_decycle(answer, job["input"])
+                elif stage == REVIEW_STAGE:
+                    # load_job が、入力を回 K の答えから作り直したものと同じと確かめてある
+                    result = check_review(answer, job["input"])
                 elif stage == "classify":
                     result = check_classify(answer, job)
                 else:
@@ -2045,6 +2389,8 @@ class Round:
                 rid = self.round_id()
                 for cut in result["cuts"]:
                     self.memory_add(self.node_by_id(cut["to"]), self.node_by_id(cut["from"]), cut["reason"], rid, k)
+            elif stage == REVIEW_STAGE:
+                self.review_answer_put(job["input"], result)
             elif stage == "classify":
                 self._nodes = None
                 for uid, labels in result.items():
@@ -2075,7 +2421,7 @@ class Round:
             # units は「ノードの無い単位」。根拠付けの失敗ではノードを消さないので空にし、決定を decision に書く。
             # 輪を断つ段の失敗は、成分の決定（複数）を decisions に書く
             rec = {"job_id": job["job_id"], "stage": stage}
-            if stage_kind(stage) == "link":
+            if stage_kind(stage) in ("link", REVIEW_STAGE):
                 rec.update({"units": [], "decision": job["input"]["target"]["id"]})
             elif stage_kind(stage) == "decycle":
                 rec.update({"units": [], "decisions": [n["id"] for n in job["input"]["nodes"]]})
@@ -2228,11 +2574,40 @@ class Round:
                     self.judge(job)
         # 判定で増えた失敗と記憶を、後の段を作るときに見落とさないよう、回ごとのメモを1回だけ捨てる
         self._clear_pass_memos()
+        # (1b) 反論の段の issued のジョブを判定する。反論のジョブがあるのは終わった回 K まで全部の段が済んだあとだけなので、
+        # K は読むだけの walk（final_pass）で取れる。取れないのは前の段が書き換えられたときだけ
+        review_ids = self.created(REVIEW_STAGE, rid)
+        if review_ids:
+            try:
+                self.review_k()
+            except PaceError:
+                raise PaceError("反論の段の前の段が揃っていません（輪を断つジョブなどが書き換えられました）。"
+                                "init を打ち直してください")
+            targets = self.review_targets()
+            for job_id in review_ids:
+                job = self.load_review_job(job_id, targets)
+                if job.get("status") == "issued":
+                    self.judge(job)
         # (2) 段を作る: 段を前から順に見る。ジョブが残っている段で止める
         kind, value = self.walk(rid)
         if kind == "emit":
             return value
-        # (3) 終わった回 K まで通った（網羅は walk が確かめた）。ノードを書く
+        # (2b) 終わった回 K まで通った（網羅は walk が確かめた）。反論の段を見る（無ければ作る。ジョブが残れば出す）
+        self._review_k = value
+        review_ids = self.created(REVIEW_STAGE, rid)
+        if review_ids is None:
+            review_ids = self.write_stage(REVIEW_STAGE, rid, self.make_review(rid))
+        pending = []
+        for job_id in review_ids:
+            job = self.load_job(REVIEW_STAGE, job_id)
+            if job.get("status") == "pending":
+                pending.append(job)
+            elif job.get("status") == "issued":
+                raise PaceError("答えを待っているジョブがあります。束を subagent に渡してから打ってください")
+        if pending:
+            return self.emit(REVIEW_STAGE, pending)
+        self.review_done(rid)
+        # (3) 反論の段まで済んだ。ノードを書く
         nodes = self.node_list()
         write_atomic(self.work / "nodes.jsonl",
                      "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in nodes).encode("utf-8"),
@@ -2271,6 +2646,396 @@ def verify_(plan_arg):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# report・show・shown（docs/plans/pace_design.md の18〜22節）
+# ---------------------------------------------------------------------------
+
+# show.md の境目の行。pace.py が書く最後の行で、書き手はその後ろにだけ注記を足す。チャットでも GitHub でも見えるよう、
+# HTML コメントにしない。読む人は「囲みの外で最初に現れる境目の行」で探す（プランの原文と差分はいつも囲みの中）
+BOUNDARY = "---- ここから下は書き手の注記で、pace.py は書いていない ----"
+SHOW_NOTE = "差分の中の事実・価値の文・回答の引用と、境目より後ろの注記は書き手が書いたもので、照合していない。"
+GAP_LABEL = {"fact": "足りない事実", "requirement": "要求", "value": "価値判断"}
+STAGE_LABEL = {"classify": "分類", "adjudicate": "裁定", "link": "根拠付け", "decycle": "輪を断つ", REVIEW_STAGE: "反論"}
+SHA256 = re.compile(r"[0-9a-f]{64}")
+NEWLINES = re.compile(r"\r\n|\r|\n| | |\x85")
+
+
+def fence(text, lang, indent):
+    """原文や差分をコードブロックで囲む。囲みは、中に出る backtick のいちばん長い並びより1つ長くする（3つ以上）。"""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    mark = "`" * max(3, longest + 1)
+    return [indent + mark + lang] + [indent + line if line else "" for line in text.split("\n")] + [indent + mark]
+
+
+def inline(text, table=False):
+    """AI の文を1行のインラインコードにする（改行は空白1つ）。中身が backtick で始まるか終わるときは、前後に空白を
+    1つずつ足す（GFM の決まり。足さないと囲みが成り立たず、中の <!-- --> が効いて後ろが消える）。表の中では | を \\| にする。"""
+    t = NEWLINES.sub(" ", text)
+    longest = max((len(m) for m in re.findall(r"`+", t)), default=0)
+    mark = "`" * (longest + 1)
+    if t.startswith("`") or t.endswith("`"):
+        t = " " + t + " "
+    out = mark + t + mark
+    return out.replace("|", "\\|") if table else out
+
+
+def read_rounds(work):
+    """rounds.jsonl の読めた行。読めない行・形の違う行は読み飛ばし、ふつうのファイルとして読めなければ空とみなす
+    （init は rounds.jsonl を残すので、壊れたものに「init を打ち直して」と案内しても直らない。cache/ と同じ）。"""
+    try:
+        data = read_regular(Path(work) / "rounds.jsonl")
+    except (OSError, ValueError):
+        return []
+    out = []
+    for raw in data.split(b"\n"):
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("kind") == "report":
+            ok = (type(obj.get("round")) is int and isinstance(obj.get("run"), str) and ROUND_ID.fullmatch(obj["run"])
+                  and isinstance(obj.get("plan_sha256"), str) and SHA256.fullmatch(obj["plan_sha256"])
+                  and all(type(obj.get(key)) is int for key in ("failed_jobs", "fixes", "questions", "since_shown"))
+                  and obj.get("next") in ("continue", "show"))
+        elif obj.get("kind") == "shown":
+            ok = (type(obj.get("after_round")) is int and isinstance(obj.get("snapshot_sha256"), str)
+                  and SHA256.fullmatch(obj["snapshot_sha256"]))
+        else:
+            ok = False
+        if ok:
+            out.append(obj)
+    return out
+
+
+def write_rounds(work, lines):
+    """読めた行に新しい行を足した全体を書く（読めない行は、このときに落ちる）。1行1件は ensure_ascii で書く。"""
+    write_atomic(Path(work) / "rounds.jsonl", "".join(json.dumps(x) + "\n" for x in lines).encode("ascii"), PRIVATE_FILE)
+
+
+def status_line(failed_jobs, fixes, questions):
+    return "PACE-STATUS: errors=0 failed_jobs=%d fixes=%d questions=%d" % (failed_jobs, fixes, questions)
+
+
+class Writer:
+    """report.md・fixes.md・questions.md・show.md の中身を作る。パスはプランと同じディレクトリからの相対だけを書く。"""
+
+    def __init__(self, rnd, f):
+        self.rnd, self.f = rnd, f
+        self.nodes = {n["id"]: n for n in rnd.node_list()}
+
+    def unit_text(self, node_id):
+        n = self.nodes[node_id]
+        return self.rnd.units[self.rnd.pos[n["unit"]]]["text"]
+
+    def decision_block(self, d, label, indent):
+        n = self.nodes[d]
+        return ["%s- %s（行%d）:" % (indent, label, n["line"])] + fence(self.unit_text(d), "text", indent + "  ")
+
+    def item(self, no, it):
+        """項目1つの行。番号付きの箇条書きで、原文はコードブロック、AI の文はインラインコード。"""
+        sub = " " * len("%d. " % no)  # 番号の本文の桁に揃える（10以上で3字だと、下の箇条書きが項目から外れる）
+        if it["kind"] == "gap":
+            lines = ["%d. %s: %s（止めている決定 %d件）" % (no, GAP_LABEL[it["ptype"]], inline(it["text"]), len(it["blocked"]))]
+            for d in it["owners"]:
+                lines += self.decision_block(d, "この gap を持つ決定", sub)
+                if it["ptype"] != "fact":
+                    alts = self.nodes[d].get("alternatives", [])
+                    if alts:
+                        lines.append("%s- 分類の段で出た別案: %s" % (sub, "、".join(inline(x) for x in alts)))
+            return lines
+        if it["kind"] == "defeater":
+            lines = ["%d. 反論（%s。%s）: %s" % (no, it["status"], it["type"], inline(it["text"]))]
+            lines += self.decision_block(it["decision"], "決定", sub)
+            if it["target"] != it["decision"]:
+                lines.append("%s- 反論の向き先: %s" % (sub, it["target"]))
+            if it["note"].strip():
+                lines.append("%s- 注: %s" % (sub, inline(it["note"])))
+            return lines
+        if it["kind"] == "cycle":
+            lines = ["%d. 残った輪（決定 %d件。輪を断つ段を回しても残った）" % (no, len(it["decisions"]))]
+            for d in it["decisions"]:
+                lines += self.decision_block(d, "決定 %s" % d, sub)
+            for f, t, ws in it["edges"]:
+                lines.append("%s- 辺 %s → %s: %s" % (sub, f, t, "、".join(inline(w) for w in ws)))
+            return lines
+        return ["%d. 根拠の無い決定（行%d）:" % (no, self.nodes[it["decision"]]["line"])] + fence(
+            self.unit_text(it["decision"]), "text", sub)
+
+    def items(self, items):
+        if not items:
+            return ["無し"]
+        out = []
+        for i, it in enumerate(items, start=1):
+            out += self.item(i, it)
+        return out
+
+    def unverified(self):
+        f = self.f
+        out = []
+        for job in f["failed_jobs"]:
+            out.append("- 失敗したジョブ: %s（%s。差し戻し%d回）" % (job["job_id"], STAGE_LABEL[stage_kind(job["stage"])],
+                                                          MAX_RETRIES))
+        for d in f["u"]:
+            out += self.decision_block(d, "失敗の影響を受けうる決定", "")
+        for d in f["unverified"]:
+            out += self.decision_block(d, "失敗の影響を受けうる決定を理由にした決定（unverified）", "")
+        for d in f["review_failed"]:
+            out += self.decision_block(d, "反論を確かめられなかった決定", "")
+        for uid in f["unverified_units"]:
+            unit = self.rnd.units[self.rnd.pos[uid]]
+            out += ["- 確かめられなかった単位（行%d）:" % unit["line"]] + fence(unit["text"], "text", "  ")
+        return out or ["無し"]
+
+    def list_file(self, title, items, status):
+        return "\n".join(["# %s: %s（%d件）" % (title, self.rnd.plan.name, len(items)), "", status, ""] + self.items(items)) + "\n"
+
+    def report(self, status, record, note=None):
+        f, a = self.f, self.f["analysis"]
+        counts = {name: sum(1 for s in a["status"].values() if s == name)
+                  for name in ("rooted", "needs_gap", "ungrounded", "unverified")}
+        premises = sum(1 for n in self.nodes.values() if n["kind"] == "premise")
+        lines = ["# PACE の結果（全体）: %s" % self.rnd.plan.name, "", status, ""]
+        if note:
+            lines += [note, ""]
+        lines += ["- 周: %d（最後に見せてから%d周目）" % (record["round"], record["since_shown"]),
+                  "- 決定 %d（rooted %d・needs_gap %d・ungrounded %d・unverified %d）、ほかの決定を根に届くとみなせば届く"
+                  "決定（verify の local）%d、うち反論にかけた決定（U に入らず、答えに gap が無いもの）%d、前提 %d"
+                  % (len(a["decisions"]), counts["rooted"], counts["needs_gap"], counts["ungrounded"],
+                     counts["unverified"], sum(1 for v in a["local"].values() if v), len(f["review_targets"]), premises),
+                  "", "## 決定ごとの状態", "", "| 決定 | 行 | 状態 | ほかを根とみなしたとき |", "| --- | --- | --- | --- |"]
+        targets = set(f["review_targets"])
+        for d in a["decisions"]:
+            local = "local" if a["local"].get(d) else ("（unverified）" if a["status"][d] == "unverified" else "届かない")
+            if d in targets:
+                local += "・gap 無し（反論にかけた）"
+            lines.append("| %s | %d | %s | %s |" % (d, self.nodes[d]["line"], a["status"][d], local))
+        defeaters = ([("refuted", x) for x in f["refuted"]]
+                     + [("accepted", x) for x in f["fixes"] if x["kind"] == "defeater"]
+                     + [("needs_human", x) for x in f["questions"] if x["kind"] == "defeater"])
+        lines += ["", "## 反論（%d件）" % len(defeaters), ""]
+        if defeaters:
+            lines += ["| 決定 | 向き先 | 種類 | 処理 | 中身 | 反証の根拠（refuted だけ） |", "| --- | --- | --- | --- | --- | --- |"]
+            for _, x in defeaters:
+                lines.append("| %s | %s | %s | %s | %s | %s |" % (x["decision"], x["target"], x["type"], x["status"],
+                                                                  inline(x["text"], table=True), " ".join(x["by"])))
+        else:
+            lines.append("無し")
+        cycles = [x for x in f["fixes"] if x["kind"] == "cycle"]
+        lines += ["", "## 残った輪（%d件）" % len(cycles), ""]
+        lines += [" ".join(c["decisions"]) for c in cycles] or ["無し"]
+        cuts = []
+        for d in a["decisions"]:
+            for c in self.rnd.memory_get(self.nodes[d]):
+                cuts.append((d, c))
+        lines += ["", "## 切った辺（参考）", ""]
+        if cuts:
+            lines += ["| 切られた側 | 理由にした側（原文） | 理由 |", "| --- | --- | --- |"]
+            for d, c in cuts:
+                lines.append("| %s | %s | %s |" % (d, inline(c["from_plan_text"], table=True), inline(c["reason"], table=True)))
+        else:
+            lines.append("無し")
+        lines += ["", "## 確かめられなかったもの", ""] + self.unverified()
+        return "\n".join(lines) + "\n"
+
+    def show(self, status, diff_lines, first):
+        f = self.f
+        lines = ["# PACE の結果: %s" % self.rnd.plan.name, "", status, "",
+                 "## 人間への質問（%d件）" % len(f["questions"]), ""] + self.items(f["questions"])
+        lines += ["", "## 残った直すもの（%d件）" % len(f["fixes"]), ""] + self.items(f["fixes"])
+        lines += ["", "## 確かめられなかったもの", ""] + self.unverified()
+        lines += ["", "## 最後に見せてからの差分", ""]
+        if first:
+            lines += ["初回（まだ人間に見せていない基準。rounds.jsonl に見せた記録が無いときもこう出し、そのときは基準が人間に"
+                      "見せたものかは分からない）。", ""]
+        if diff_lines:
+            lines += fence("\n".join(diff_lines), "diff", "")
+        elif first:
+            lines.append("基準からは変わっていません。")
+        else:
+            lines.append("最後に見せてから変わっていません。")
+        lines += ["", "## 注意", "", SHOW_NOTE, "", BOUNDARY]
+        return "\n".join(lines) + "\n"
+
+
+def unreadable_show(name):
+    return "\n".join(["# PACE の結果: %s" % name, "", UNREADABLE_STATUS, "",
+                      "プランを読めませんでした（無いか、UTF-8 ではありません）。", "", BOUNDARY]) + "\n"
+
+
+def plan_lines(data):
+    return LINE_END.split(data.decode("utf-8-sig", errors="replace"))
+
+
+def wrap_os(e, what, where):
+    return PaceError("%s（%s）: %s" % (what, e.strerror or e, e.filename or where))
+
+
+def report_(plan_arg):
+    try:
+        rnd = Round(plan_arg, readonly=True)
+        f = rnd.findings()
+        rid = rnd.round_id()
+        sha = hashlib.sha256(rnd.plan_bytes).hexdigest()
+        rounds = read_rounds(rnd.work)
+        fixes, questions, failed = len(f["fixes"]), len(f["questions"]), len(f["failed_jobs"])
+        record = next((x for x in rounds if x["kind"] == "report" and x["run"] == rid), None)
+        note = None
+        new = record is None
+        if not new:
+            # 同じ周の2回目は行を足さず、記録した値をそのまま使う（同じ周を2回数えると、上限に早く着く）
+            if (record["failed_jobs"], record["fixes"], record["questions"]) != (failed, fixes, questions):
+                note = ("この周の記録（failed_jobs=%d fixes=%d questions=%d）と、計算し直した件数が違います（間にジョブの "
+                        "status が書き換えられたとみられます）。標準出力の2行は記録の値です。"
+                        % (record["failed_jobs"], record["fixes"], record["questions"]))
+        else:
+            last_shown = max((i for i, x in enumerate(rounds) if x["kind"] == "shown"), default=-1)
+            since = [x for x in rounds[last_shown + 1:] if x["kind"] == "report"]
+            since_shown = len(since) + 1
+            prev = since[-1] if since else None
+            # 順1〜4（7節）。順1は最後に見せたあとの1つ前の周とだけ比べ、その周に失敗したジョブがあれば当てない
+            if prev is not None and prev["plan_sha256"] == sha and prev["failed_jobs"] == 0:
+                nxt = "show"
+            elif since_shown >= 3:
+                nxt = "show"
+            elif fixes == 0:
+                nxt = "show"
+            else:
+                nxt = "continue"
+            a = f["analysis"]
+            gaps = {p: sum(1 for g in a["gaps"] if g["ptype"] == p) for p in PTYPES}
+            record = {"kind": "report", "round": max((x["round"] for x in rounds if x["kind"] == "report"), default=0) + 1,
+                      "run": rid, "plan_sha256": sha, "units": len(rnd.units), "decisions": len(a["decisions"]),
+                      "rooted": sum(1 for s in a["status"].values() if s == "rooted"),
+                      "needs_gap": sum(1 for s in a["status"].values() if s == "needs_gap"),
+                      "ungrounded": sum(1 for s in a["status"].values() if s == "ungrounded"),
+                      "unverified": sum(1 for s in a["status"].values() if s == "unverified"),
+                      "gaps": gaps, "defeaters": f["defeaters"], "failed_jobs": failed, "fixes": fixes,
+                      "questions": questions, "since_shown": since_shown, "next": nxt}
+            rounds.append(record)
+        status = status_line(record["failed_jobs"], record["fixes"], record["questions"])
+        w = Writer(rnd, f)
+        work = rnd.work
+        write_atomic(work / "report.md", w.report(status, record, note).encode("utf-8"), PRIVATE_FILE)
+        write_atomic(work / "fixes.md", w.list_file("残った直すもの", f["fixes"], status).encode("utf-8"), PRIVATE_FILE)
+        write_atomic(work / "questions.md", w.list_file("人間への質問", f["questions"], status).encode("utf-8"),
+                     PRIVATE_FILE)
+        if new:
+            write_rounds(work, rounds)
+    except OSError as e:
+        raise wrap_os(e, "作業ディレクトリに書けませんでした", plan_arg)
+    except RecursionError:
+        raise PaceError("作業ディレクトリのファイルの入れ子が深すぎます。init を打ち直してください")
+    except UnicodeEncodeError:
+        raise PaceError("UTF-8 で書けない字があるので書けません。init を打ち直してください")
+    try:
+        sys.stdout.write("FILE fixes %s\n%s\nNEXT: %s\n" % ((work / "fixes.md").absolute(), status, record["next"]))
+    except UnicodeEncodeError:
+        raise PaceError("出力を UTF-8 で表せません")
+    return 0
+
+
+def show_(plan_arg):
+    plan = Path(plan_arg)
+    pace_dir, work = workdir_for(plan)
+    try:
+        check_dir(pace_dir)
+        check_dir(work)
+        check_owner(plan, work)
+        # 古い写しは、どの道でも最初に消す（前の show のコマンド行で、人間が見ていない版を繰り上げさせない）
+        snap = work / "show_snapshot.md"
+        if os.path.lexists(str(snap)):
+            if os.path.isdir(str(snap)) and not os.path.islink(str(snap)):
+                raise PaceError("%s がディレクトリです。消してから打ち直してください" % snap)
+            os.unlink(str(snap))
+    except OSError as e:
+        raise wrap_os(e, "作業ディレクトリを確かめられませんでした", work)
+    read = read_plan(plan)
+    if read is None:
+        # 性質5: 「読めなかった」だけを書き、写しを作らない。.pace/ を作るなら .gitignore も init と同じく書く。
+        # source.json は書かない（無ければ check_owner がいまのプランのものとみなすので、あとの init は通る。
+        # 打ち間違えたパスの名前を控えて、正しいプランの init を止めないため）
+        try:
+            make_private_dir(pace_dir)
+            write_atomic(pace_dir / ".gitignore", b"*\n", PRIVATE_FILE)
+            make_private_dir(work)
+            write_atomic(work / "show.md", unreadable_show(plan.name).encode("utf-8"), PRIVATE_FILE)
+        except OSError as e:
+            raise wrap_os(e, "作業ディレクトリに書けませんでした", work)
+        except UnicodeEncodeError:
+            raise PaceError("プランの名前が UTF-8 で表せないので、書けません")
+        sys.stdout.write("FILE show %s\n%s\n" % ((work / "show.md").absolute(), UNREADABLE_STATUS))
+        return 0
+    try:
+        rnd = Round(plan_arg, readonly=True)
+        f = rnd.findings()
+        shown = work / "shown.md"
+        if not os.path.lexists(str(shown)):
+            raise PaceError("%s がありません。init を打ち直してください（init が作り直します）" % shown)
+        try:
+            base = read_regular(shown)
+        except ValueError:
+            raise PaceError("%s がふつうのファイルではありません。消してから init を打ってください" % shown)
+        rounds = read_rounds(work)
+        shown_lines = [x for x in rounds if x["kind"] == "shown"]
+        first = not shown_lines or shown_lines[-1]["snapshot_sha256"] != hashlib.sha256(base).hexdigest()
+        diff = list(difflib.unified_diff(plan_lines(base), plan_lines(rnd.plan_bytes), fromfile="最後に見せた版",
+                                         tofile="いまの版", n=1, lineterm=""))
+        status = status_line(len(f["failed_jobs"]), len(f["fixes"]), len(f["questions"]))
+        body = Writer(rnd, f).show(status, diff, first)
+        write_atomic(work / "show.md", body.encode("utf-8"), PRIVATE_FILE)
+        write_atomic(work / "show_snapshot.md", rnd.plan_bytes, PRIVATE_FILE)
+    except OSError as e:
+        raise wrap_os(e, "作業ディレクトリに書けませんでした", work)
+    except RecursionError:
+        raise PaceError("作業ディレクトリのファイルの入れ子が深すぎます。init を打ち直してください")
+    except UnicodeEncodeError:
+        raise PaceError("UTF-8 で書けない字があるので書けません。init を打ち直してください")
+    try:
+        sys.stdout.write("FILE show %s\n%s\nSNAPSHOT %s\n" % ((work / "show.md").absolute(), status,
+                                                          hashlib.sha256(rnd.plan_bytes).hexdigest()))
+    except UnicodeEncodeError:
+        raise PaceError("出力を UTF-8 で表せません")
+    return 0
+
+
+def shown_(plan_arg, sha):
+    """写しの sha256 が合うときだけ、shown.md を写しで置き換え、rounds.jsonl に shown の行を足し、写しを消す（この順）。"""
+    if not SHA256.fullmatch(sha):
+        raise PaceError("sha256 の形（64桁の16進の小文字）ではありません: %s" % sha)
+    plan = Path(plan_arg)
+    pace_dir, work = workdir_for(plan)
+    try:
+        # shown は Round を作らない（プランが読めなくても打てる）ので、作業ディレクトリが自分のプランのものかをここで確かめる
+        check_dir(pace_dir)
+        check_dir(work)
+        check_owner(plan, work)
+        snap = work / "show_snapshot.md"
+        if not os.path.lexists(str(snap)):
+            raise PaceError("写し（%s）がありません。show から打ち直してください" % snap)
+        try:
+            data = read_regular(snap)
+        except ValueError:
+            raise PaceError("写し（%s）がふつうのファイルではありません。show から打ち直してください" % snap)
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise PaceError("写しの sha256 が合いません（show を打ち直したか、写しが書き換えられました）。何も変えていません")
+        shown = work / "shown.md"
+        if os.path.lexists(str(shown)) and (os.path.islink(str(shown)) or not stat.S_ISREG(os.lstat(str(shown)).st_mode)):
+            # init と同じく、作業ディレクトリの外を指すかもしれないリンクを壊さない
+            raise PaceError("%s がふつうのファイルではありません。消してから init を打ってください" % shown)
+        write_atomic(shown, data, PRIVATE_FILE)
+        rounds = read_rounds(work)
+        after = max((x["round"] for x in rounds if x["kind"] == "report"), default=0)
+        rounds.append({"kind": "shown", "after_round": after, "snapshot_sha256": sha})
+        write_rounds(work, rounds)
+        os.unlink(str(snap))
+    except OSError as e:
+        raise wrap_os(e, "作業ディレクトリに書けませんでした", work)
+    sys.stdout.write("SHOWN after_round=%d\n" % after)
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="pace.py", description="PACE の機械の仕事を受け持つ")
     parser.add_argument("--version", action="store_true", help="段ごとの版の一覧を出す")
@@ -2279,14 +3044,23 @@ def main(argv=None):
     p_init.add_argument("plan", help="プランのパス")
     p_next = sub.add_parser("next", help="前の波の答えを取り込み、次の波の束を出す")
     p_next.add_argument("plan", help="プランのパス")
-    p_verify = sub.add_parser("verify", help="DONE まで進んだ作業ディレクトリを書き換えずに読み、根への到達と gap の効きを出す")
+    p_verify = sub.add_parser("verify", help="終わった回 K まで進んだ作業ディレクトリを書き換えずに読み、根への到達と gap の効きを"
+                                             "出す（反論の段は見ない）")
     p_verify.add_argument("plan", help="プランのパス")
+    p_report = sub.add_parser("report", help="反論の段まで済んだ作業ディレクトリから、直すものと訊くものを書き、周を続けるかを出す")
+    p_report.add_argument("plan", help="プランのパス")
+    p_show = sub.add_parser("show", help="人間に見せる show.md と、プランの写しを書く")
+    p_show.add_argument("plan", help="プランのパス")
+    p_shown = sub.add_parser("shown", help="見せた写しを、次に見せるときの差分の基準にする")
+    p_shown.add_argument("plan", help="プランのパス")
+    p_shown.add_argument("sha256", help="show が出した写しの sha256")
     args = parser.parse_args(argv)
     if args.version:
         for name, version in STAGE_VERSIONS:
             print(f"{name} {version}")
         return 0
-    commands = {"init": init, "next": next_, "verify": verify_}
+    commands = {"init": init, "next": next_, "verify": verify_, "report": report_, "show": show_,
+                "shown": lambda plan: shown_(plan, args.sha256)}
     if args.command in commands:
         try:
             return commands[args.command](args.plan)
