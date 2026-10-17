@@ -1428,7 +1428,7 @@ class Round:
             return None
 
     # 輪を断つ段のキャッシュは2つの形を持つ（16節）。鍵の入力の形が違うので、sha256 で取り違えない。
-    # - 答え: cache_key("decycle", {"nodes","edges"}) に {"cuts": [{"from","to","reason"}]}。walk の確かめにだけ使い、
+    # - 答え: cache_key("decycle", {"nodes","edges"}) に {"cuts_answer": {"cuts": [{"from","to","reason"}]}}。walk の確かめにだけ使い、
     #   キャッシュに当たってもジョブは省かない（省くと記憶を書く場面が無くなる）
     # - 記憶: cache_key("decycle", {"to_plan_text","to_text"}) に {"cuts": [{"from_plan_text","from_text","reason","round","pass"}]}
 
@@ -1450,17 +1450,22 @@ class Round:
                                           "to_text": node["text"]})
 
     def memory_get(self, node):
-        """決定の記憶（切った辺の列）。無いか、壊れていれば空（次に書くときに上書きする）。"""
-        if node["id"] in self._memory:
-            return self._memory[node["id"]]
-        obj = self._read_cache_obj(self.memory_key(node))
+        """決定の記憶（切った辺の列）。無いか、壊れていれば空（次に書くときに上書きする）。
+
+        読み置きはファイルと同じ鍵（文）で持つ。同じ文の決定が2つあると記憶のファイルを共有するので、決定の id で持つと、
+        片方に書き足したときにもう片方の読み置きが古いまま残り、次に書くときに先の分を消す。
+        """
+        key = self.memory_key(node)
+        if key in self._memory:
+            return self._memory[key]
+        obj = self._read_cache_obj(key)
         cuts = obj.get("cuts") if isinstance(obj, dict) else None
         ok = isinstance(cuts, list) and all(
             isinstance(c, dict) and all(isinstance(c.get(k), str) for k in ("from_plan_text", "from_text", "reason"))
             and isinstance(c.get("round"), str) and ROUND_ID.fullmatch(c["round"])
             and type(c.get("pass")) is int and 1 <= c["pass"] <= MAX_DECYCLE for c in cuts)
         result = [dict(c) for c in cuts] if ok else []
-        self._memory[node["id"]] = result
+        self._memory[key] = result
         return result
 
     def memory_add(self, to_node, from_node, reason, rid, k):
@@ -1474,9 +1479,10 @@ class Round:
                 break
         else:
             cuts.append(entry)
+        key = self.memory_key(to_node)
         make_private_dir(self.cache_dir)
-        write_json(self.cache_dir / (self.memory_key(to_node) + ".json"), {"cuts": cuts})
-        self._memory[to_node["id"]] = cuts
+        write_json(self.cache_dir / (key + ".json"), {"cuts": cuts})
+        self._memory[key] = cuts
 
     # --- ジョブ -----------------------------------------------------------
 
@@ -1869,7 +1875,9 @@ class Round:
     def check_decycle_stage(self, k, ids, rid):
         """作られた decycle_k の列を作り直した成分の列と丸ごと比べ、done のジョブの痕跡（答えのキャッシュと記憶）を確かめる。
 
-        decycle_6 の無い回6でも、記憶の消失と失敗したジョブの status の書き換えを見つけるため（16節）。
+        decycle_6 の無い回6でも、いまの周に切った辺の記憶の消失と、失敗したジョブを done に書き換えたことを見つけるため（16節）。
+        done を failed に書き換えたことは見つけない（影響を受けうる決定が増える側に倒れる）。前の周に切った辺の記憶の消失も
+        見つけない（突き合わせる痕跡が残らない。10節）。
         """
         stage = "decycle_%d" % k
         want = ["%s_%03d_%s" % (stage, i, rid) for i in range(1, len(self.decycle_components(k)) + 1)]
@@ -1894,11 +1902,18 @@ class Round:
                                 "init を打ち直してください" % self.job_path(stage, job_id))
 
     def final_pass(self):
-        """終わった回 K。next が DONE まで進んでいなければ 1 で終わる（読むだけ。何も作らない）。"""
+        """終わった回 K。next が DONE まで進んでいなければ 1 で終わる（段は作らない）。
+
+        readonly でない Round では、round_id と created が印の無い jobs/ や印の合わない段を消しうるので、
+        next の外から呼ぶ段（#7 の report など）は readonly の Round を使う。
+        """
         return self.walk(self.round_id(), create=False)[1]
 
     def link_answer(self, decision_id, k=None):
-        """決定の回 k（省けば終わった回 K）の根拠付けの答え。無ければ None。後の段とテストが使う。"""
+        """決定の回 k（省けば終わった回 K）の根拠付けの答え。無ければ None。後の段とテストが使う。
+
+        k を省くと final_pass を通るので、next の外からは readonly の Round で呼ぶ（final_pass の注意を参照）。
+        """
         if k is None:
             k = self.final_pass()
         return self.pass_answers(k).get(decision_id)

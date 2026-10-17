@@ -54,7 +54,7 @@ def link_for(job):
     """SUPPORT の候補が入力にあれば、それを理由にする。外されていれば gap にする。"""
     target = job["input"]["target"]
     ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
-    froms = [ids[t] for t in SUPPORT[target["plan_text"]] if t in ids]
+    froms = [ids[t] for t in SUPPORT.get(target["plan_text"], []) if t in ids]
     if froms:
         return {"claims": [], "gaps": [], "need": [],
                 "steps": [{"from": froms, "to": target["id"], "warrant": "理由"}]}
@@ -66,6 +66,25 @@ def cut_b_to_a(job):
     """B → A の辺を切る。"""
     ids = {n["plan_text"]: n["id"] for n in job["input"]["nodes"]}
     return {"cuts": [{"from": ids["決定Bを選ぶ。"], "to": ids["決定Aを選ぶ。"], "reason": "並列の決定で理由ではない"}]}
+
+
+def ring_link(job):
+    """決定 i は、候補にある決定 i+1, i+2, … のうち最初のものを理由にする（7つの決定の輪。切るたびに輪が1つ縮む）。"""
+    target = job["input"]["target"]
+    ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+    i = int(target["plan_text"][2])
+    for off in range(1, 7):
+        text = "決定%dを選ぶ。" % ((i + off - 1) % 7 + 1)
+        if text in ids:
+            return {"claims": [], "gaps": [], "need": [],
+                    "steps": [{"from": [ids[text]], "to": target["id"], "warrant": "理由"}]}
+    return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "t"}], "need": [],
+            "steps": [{"from": ["g1"], "to": target["id"], "warrant": "理由"}]}
+
+
+def cut_first(job):
+    e = job["input"]["edges"][0]
+    return {"cuts": [{"from": e["from"], "to": e["to"], "reason": "理由ではない"}]}
 
 
 class GraphTest(unittest.TestCase):
@@ -131,6 +150,38 @@ class GraphTest(unittest.TestCase):
         v = pace.strengths(ids, answers, premises=frozenset({"P"}))
         self.assertEqual((v["A"], v["B"], v["E"]), (pace.ROOTED, pace.ROOTED, pace.ROOTED))
 
+    def test_r2_trimmed_to_nothing_is_seen_by_pick_additions(self):
+        """字数で r2 を作れなかった決定（足す候補はあったが全部削った）を、pick_additions と trim_r2 で見分けられる。"""
+        units = pace.split_units("# 題\n\n## 節\n\n決める。\n\n## 遠く\n\n" + "".join("埋め%d。\n\n" % i for i in range(9))
+                                 + "理由の文がここにある。\n")
+        nodes = []
+        for u in units:
+            kind = "decision" if u["text"] == "決める。" else "premise"
+            node = {"id": ("D_" if kind == "decision" else "P_") + u["id"][1:] + "_1", "kind": kind, "text": u["text"],
+                    "unit": u["id"], "line": u["line"], "sec": u["sec"], "path": u["path"]}
+            if kind == "decision":
+                node["alternatives"] = ["別"]
+            else:
+                node["ptype"] = "fact"
+            nodes.append(node)
+        target = next(n for n in nodes if n["kind"] == "decision")
+        r1 = pace.select_candidates(units, nodes, target)
+        answer = {"claims": [], "gaps": [], "steps": [], "need": ["理由の文"]}
+        added = pace.pick_additions(units, nodes, target, r1, answer)
+        self.assertTrue(added)
+        self.assertIsNotNone(pace.expand_candidates(units, nodes, target, r1, answer))
+        old = pace.LINK_JOB_MAX_CHARS
+        pace.LINK_JOB_MAX_CHARS = pace.link_size(r1) + 1
+        try:
+            self.assertIsNone(pace.expand_candidates(units, nodes, target, r1, answer))
+            self.assertTrue(pace.pick_additions(units, nodes, target, r1, answer))
+        finally:
+            pace.LINK_JOB_MAX_CHARS = old
+        # 外す決定は 2-gram の追加候補にも入らない
+        far = next(n for n in nodes if n["text"] == "理由の文がここにある。")
+        self.assertNotIn(far["id"], [n["id"] for _, n in pace.pick_additions(units, nodes, target, r1, answer,
+                                                                            excluded=frozenset({far["id"]}))])
+
     def test_leverage(self):
         ids = ["A", "B", "C", "U"]
         answers = self.answers({"A": (["g1"], ["g1"]), "B": (["A"], ()), "C": (["g1", "g2"], ["g1", "g2"]),
@@ -140,7 +191,9 @@ class GraphTest(unittest.TestCase):
         self.assertEqual(lev, {("A", "g1"): 2})
 
 
-class DecycleFlowTest(unittest.TestCase):
+class FlowBase(unittest.TestCase):
+    """流れのテストの道具（next と verify を subprocess で叩き、実行役の代わりに答えを書く）。"""
+
     def setUp(self):
         self._umask = os.umask(0o022)
         self.addCleanup(os.umask, self._umask)
@@ -201,6 +254,8 @@ class DecycleFlowTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
+
+class DecycleFlowTest(FlowBase):
     def test_cycle_is_cut_and_relinked(self):
         self.init()
         last, waves = self.drive()
@@ -262,7 +317,18 @@ class DecycleFlowTest(unittest.TestCase):
         self.assertIn("init を打ち直して", r.stderr)
         r = self.verify(ok=False)
         self.assertEqual(r.returncode, 1)
+        # verify は walk の痕跡の確かめ（切った辺の記憶）で止まる
+        self.assertIn("切った辺の記憶がありません", r.stderr)
         self.assertIn("init を打ち直して", r.stderr)
+
+    def test_corrupt_memory_is_read_as_empty(self):
+        self.init()
+        self.drive()
+        rnd = pace.Round(str(self.plan), readonly=True)
+        node = rnd.node_by_id(self.ids()["決定Aを選ぶ。"])
+        self.assertEqual(len(rnd.memory_get(node)), 1)
+        (self.work / "cache" / (rnd.memory_key(node) + ".json")).write_text('{"cuts": [{"from_text": 1}]}')
+        self.assertEqual(pace.Round(str(self.plan), readonly=True).memory_get(node), [])
 
     def test_decycle_failure_is_unverified_not_cycle(self):
         self.init()
@@ -281,12 +347,23 @@ class DecycleFlowTest(unittest.TestCase):
     def test_link_failure_is_unverified(self):
         self.init()
 
+        support = {"決定Aを選ぶ。": ["前提の文。"], "決定Bを選ぶ。": ["決定Cを選ぶ。"], "決定Cを選ぶ。": ["前提の文。"]}
+
         def fail_c(job):
-            return None if job["input"]["target"]["plan_text"] == "決定Cを選ぶ。" else link_for(job)
+            if job["input"]["target"]["plan_text"] == "決定Cを選ぶ。":
+                return None
+            ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+            froms = [ids[x] for x in support[job["input"]["target"]["plan_text"]]]
+            return {"claims": [], "gaps": [], "need": [],
+                    "steps": [{"from": froms, "to": job["input"]["target"]["id"], "warrant": "理由"}]}
         last, _ = self.drive(link=fail_c)
         self.assertEqual(last, "DONE decisions=3 premises=3 failed_jobs=1")
         out = self.verify().stdout.splitlines()
-        self.assertIn("DECISION %s unverified" % self.ids()["決定Cを選ぶ。"], out)
+        ids = self.ids()
+        self.assertIn("DECISION %s unverified" % ids["決定Cを選ぶ。"], out)
+        # C を理由にした B も、C の失敗に左右されるので unverified。前提から根に届く A は rooted のまま
+        self.assertIn("DECISION %s unverified" % ids["決定Bを選ぶ。"], out)
+        self.assertIn("DECISION %s rooted local" % ids["決定Aを選ぶ。"], out)
 
     def test_verify_before_done_and_reads_only(self):
         self.init()
@@ -298,9 +375,27 @@ class DecycleFlowTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("next を DONE まで回して", r.stderr)
         self.drive()
-        before = (self.work / "nodes.jsonl").read_bytes()
+        before = self.snapshot()
         self.verify()
-        self.assertEqual((self.work / "nodes.jsonl").read_bytes(), before)
+        self.assertEqual(self.snapshot(), before)
+        # 周の印の合わない段は、読むだけのときは消さずに「作られていない」とみなす
+        mark = self.work / "jobs" / "decycle_2" / "created.json"
+        info = json.loads(mark.read_text())
+        info["round"] = "00000000"
+        mark.write_text(json.dumps(info))
+        before = self.snapshot()
+        r = self.verify(ok=False)
+        self.assertIn("next を DONE まで回して", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def snapshot(self):
+        out = {}
+        for root, dirs, files in os.walk(str(self.dir / ".pace")):
+            for name in dirs + files:
+                path = Path(root) / name
+                st = os.lstat(str(path))
+                out[str(path)] = (st.st_mode, path.read_bytes() if path.is_file() else None)
+        return out
 
     def test_rewritten_decycle_job_is_rejected(self):
         self.init()
@@ -325,6 +420,73 @@ class DecycleFlowTest(unittest.TestCase):
         self.assertEqual(pace.STAGE_AGENT["decycle"], "pace-judge")
         self.assertEqual(pace.JOB_STAGES[-1], "link_r2_6")
         self.assertEqual(sum(1 for s in pace.JOB_STAGES if s.startswith("decycle_")), 5)
+
+
+class OtherPlanFlowTest(FlowBase):
+    """別のプランで回す流れ（回6まで回す輪・分類の失敗・同じ文の決定）。"""
+
+    def use(self, text):
+        self.plan.write_text(text, encoding="utf-8")
+        self.init()
+
+    def test_ring_runs_to_pass_six_and_leaves_a_cycle(self):
+        self.use("# 題\n\n## 設計\n\n" + "".join("決定%dを選ぶ。\n" % i for i in range(1, 8)))
+        last, _ = self.drive(link=ring_link, decycle=cut_first, limit=40)
+        self.assertEqual(last, "DONE decisions=7 premises=2 failed_jobs=0")
+        for k in range(1, 6):
+            self.assertEqual(len(json.loads((self.work / "jobs" / ("decycle_%d" % k) / "created.json").read_text())["jobs"]), 1)
+        self.assertTrue((self.work / "jobs" / "link_r1_6" / "created.json").exists())
+        self.assertFalse((self.work / "jobs" / "decycle_6").exists())
+        out = self.verify().stdout.splitlines()
+        self.assertIn("cycles=1", out[0])
+        cycles = [x.split()[1:] for x in out if x.startswith("CYCLE ")]
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(len(cycles[0]), 2)
+        rnd = pace.Round(str(self.plan), readonly=True)
+        self.assertEqual(rnd.final_pass(), 6)
+        # DONE のあとに打ち直しても同じ
+        self.assertEqual(parse(self.next().stdout)[1], last)
+
+    def test_failed_unit_makes_neighbors_unverified(self):
+        self.use("# 題\n\n## 設計\n\n前提の文。\n決定Aを選ぶ。\n\n## 別\n\n別の前提の文。\n")
+        texts = {u["id"]: u["text"] for u in pace.split_units(self.plan.read_text(encoding="utf-8"))}
+        for _ in range(30):
+            bundles, last = parse(self.next().stdout)
+            if last.startswith("DONE"):
+                break
+            for _, _, paths in bundles:
+                for p in paths:
+                    job = json.loads(Path(p).read_text(encoding="utf-8"))
+                    if job["stage"] == "classify" and job["variant"] == "A" and any(
+                            texts[u["uid"]] == "別の前提の文。" for u in job["input"]["units"]):
+                        continue  # 答えを書かず、差し戻しを使い切らせる
+                    self.answer([("b", "a", [p])])
+        self.assertTrue(last.startswith("DONE decisions=1 "), last)
+        out = self.verify().stdout.splitlines()
+        a = self.ids()["決定Aを選ぶ。"]
+        self.assertIn("DECISION %s unverified" % a, out)
+        self.assertIn("GAP G_%s_g1 value uncertain" % a, out)
+        self.assertIn("uncertain=1", out[0])
+        units = [x for x in out if x.startswith("UNIT ")]
+        self.assertEqual(len(units), 2)  # 「別」の見出しと文
+        self.assertIn("unverified_units=2", out[0])
+
+    def test_same_text_decisions_keep_both_cuts(self):
+        """同じ文の決定は記憶のファイルを共有する。片方に書き足しても、もう片方の分を消さない。"""
+        self.use("# 題\n\n## 設計1\n\n決定Aを選ぶ。\n決定Xを選ぶ。\n\n## 設計2\n\n決定Aを選ぶ。\n決定Yを選ぶ。\n")
+        self.drive()
+        rnd = pace.Round(str(self.plan))
+        a1, a2 = [n for n in rnd.decisions() if n["text"] == "決定Aを選ぶ。"]
+        x = next(n for n in rnd.decisions() if n["text"] == "決定Xを選ぶ。")
+        y = next(n for n in rnd.decisions() if n["text"] == "決定Yを選ぶ。")
+        self.assertEqual(rnd.memory_key(a1), rnd.memory_key(a2))
+        rnd.memory_get(a1)
+        rnd.memory_get(a2)
+        rid = rnd.round_id()
+        rnd.memory_add(a1, x, "r", rid, 1)
+        rnd.memory_add(a2, y, "r", rid, 1)
+        froms = sorted(c["from_text"] for c in pace.Round(str(self.plan), readonly=True).memory_get(a1))
+        self.assertEqual(froms, ["決定Xを選ぶ。", "決定Yを選ぶ。"])
 
 
 if __name__ == "__main__":
