@@ -214,7 +214,7 @@ class FlowBase(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
         return r
 
-    def answer(self, bundles, link=link_for, decycle=cut_b_to_a):
+    def answer(self, bundles, link=link_for, decycle=cut_b_to_a, review=lambda job: {"defeaters": []}):
         texts = {u["id"]: u["text"] for u in pace.split_units(self.plan.read_text(encoding="utf-8"))}
         for _, _, paths in bundles:
             for p in paths:
@@ -229,6 +229,8 @@ class FlowBase(unittest.TestCase):
                     ans = link(job)
                 elif job["stage"].startswith("decycle_"):
                     ans = decycle(job)
+                elif job["stage"] == "review":
+                    ans = review(job)
                 else:
                     ans = {"labels": []}
                 if ans is not None:
