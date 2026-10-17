@@ -444,10 +444,139 @@ class DecycleFlowTest(FlowBase):
     def test_versions_and_instructions(self):
         self.assertEqual(dict(pace.STAGE_VERSIONS)["link"], "2026-10-17.1")
         self.assertEqual(dict(pace.STAGE_VERSIONS)["decycle"], "2026-10-17.1")
+        self.assertEqual(dict(pace.STAGE_VERSIONS)["review"], "2026-10-17.1")
         self.assertIn("input.excluded_note", pace.INSTRUCTIONS["link"])
         self.assertEqual(pace.STAGE_AGENT["decycle"], "pace-judge")
+        # 反論の段は JOB_STAGES の外に置くので、並びと末尾は #6 のまま
         self.assertEqual(pace.JOB_STAGES[-1], "link_r2_6")
+        self.assertEqual(pace.REVIEW_STAGE, "review")
         self.assertEqual(sum(1 for s in pace.JOB_STAGES if s.startswith("decycle_")), 5)
+
+    def test_round_guard_of_the_memory_check(self):
+        """walk の確かめの「いまの周の印」の条件（c["round"] == rid）。
+
+        流れで記憶の round を書き換えると、exclusions が回1から外して link_r1 の load_job が先に止めるので、守りに届かない。
+        回のメモを先に埋めてから、記憶の読み置きの round を書き換えて叩く。
+        """
+        self.init()
+        self.drive()
+        rnd = pace.Round(str(self.plan), readonly=True)
+        rid = rnd.round_id()
+        ids = rnd.created("decycle_1", rid)
+        rnd.check_decycle_stage(1, ids, rid)
+        a = rnd.node_by_id(self.ids()["決定Aを選ぶ。"])
+        key = rnd.memory_key(a)
+        rnd._memory[key] = [dict(c, round="00000000") for c in rnd._memory[key]]
+        with self.assertRaisesRegex(pace.PaceError, "切った辺の記憶がありません"):
+            rnd.check_decycle_stage(1, ids, rid)
+
+    def test_memory_add_rewrites_round_and_pass(self):
+        """from が同じ記憶は、round と pass と理由をいまのものに書き直す（足さない）。"""
+        self.init()
+        self.drive()
+        rnd = pace.Round(str(self.plan))
+        a = rnd.node_by_id(self.ids()["決定Aを選ぶ。"])
+        b = rnd.node_by_id(self.ids()["決定Bを選ぶ。"])
+        rnd.memory_add(a, b, "別の理由", "abcdef12", 3)
+        cuts = pace.Round(str(self.plan), readonly=True).memory_get(a)
+        self.assertEqual([(c["reason"], c["round"], c["pass"]) for c in cuts], [("別の理由", "abcdef12", 3)])
+
+
+def chain_link(job):
+    """A は B があれば B、無ければ C を理由にする。B と C は A を理由にする（回1で A⇄B、回2で A⇄C の輪）。"""
+    target = job["input"]["target"]
+    ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+    want = {"決定Aを選ぶ。": ["決定Bを選ぶ。", "決定Cを選ぶ。"], "決定Bを選ぶ。": ["決定Aを選ぶ。"],
+            "決定Cを選ぶ。": ["決定Aを選ぶ。"]}[target["plan_text"]]
+    for text in want:
+        if text in ids:
+            return {"claims": [], "gaps": [], "need": [],
+                    "steps": [{"from": [ids[text]], "to": target["id"], "warrant": "理由"}]}
+    return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "t"}], "need": [],
+            "steps": [{"from": ["g1"], "to": target["id"], "warrant": "理由"}]}
+
+
+def cut_into_a(job):
+    """A に入る辺を切る。"""
+    ids = {n["id"]: n["plan_text"] for n in job["input"]["nodes"]}
+    e = next(e for e in job["input"]["edges"] if ids[e["to"]] == "決定Aを選ぶ。")
+    return {"cuts": [{"from": e["from"], "to": e["to"], "reason": "理由ではない"}]}
+
+
+def ring_premise_link(job):
+    """ring_link に、前提から根に届く step を足したもの（輪は残るが、どの決定も rooted で gap が無い）。"""
+    answer = ring_link(job)
+    target = job["input"]["target"]
+    ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+    steps = [s for s in answer["steps"] if not any(f.startswith("g") for f in s["from"])]
+    steps.append({"from": [ids["前提の文。"]], "to": target["id"], "warrant": "前提から"})
+    return {"claims": [], "gaps": [], "need": [], "steps": steps}
+
+
+class RewrittenDecycleJobTest(FlowBase):
+    """輪を断つジョブの status を done から failed に書き換えたときの振る舞い（設計文書10節307行の文の確かめ）。"""
+
+    def fail_job(self, stage):
+        d = self.work / "jobs" / stage
+        ids = json.loads((d / "created.json").read_text())["jobs"]
+        path = d / (ids[0] + ".json")
+        job = json.loads(path.read_text(encoding="utf-8"))
+        job["status"] = "failed"
+        path.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+
+    def test_no_later_cycle_only_adds_failed_jobs(self):
+        """後の回の輪とも回 K の輪とも重ならなければ見つけず、failed_jobs だけが増える。"""
+        self.init()
+        self.drive()
+        self.fail_job("decycle_1")
+        self.assertEqual(parse(self.next().stdout)[1], "DONE decisions=3 premises=3 failed_jobs=1")
+        self.assertTrue(self.verify().stdout.startswith("VERIFY decisions=3 rooted=1 needs_gap=2"))
+
+    def test_later_cycle_with_the_decision_stops(self):
+        """後の回の輪を断つジョブが既に作られていて、その決定を含むなら、作り直した入力と食い違って 1 で終わる。"""
+        self.init()
+        last, _ = self.drive(link=chain_link, decycle=cut_into_a)
+        self.assertEqual(pace.Round(str(self.plan), readonly=True).final_pass(), 3)
+        self.fail_job("decycle_1")
+        for r in (self.next(ok=False), self.verify(ok=False), run("report", str(self.plan))):
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("init を打ち直して", r.stderr)
+
+    def test_rewrite_in_the_middle_shrinks_k_and_makes_u(self):
+        """後の回の段を作る前に書き換えると、その輪は断たれず反復が早く終わり（K が縮む）、終わった回の輪の決定が U に入る。
+        楽観は U を rooted に固定するので、U の外で U を理由にした決定も unverified になる。"""
+        self.init()
+        for _ in range(30):
+            bundles, last = parse(self.next().stdout)
+            stages = {json.loads(Path(p).read_text(encoding="utf-8"))["stage"] for _, _, ps in bundles for p in ps}
+            if "link_r1_2" in stages:
+                self.fail_job("decycle_1")
+                break
+            self.answer(bundles, link=chain_link, decycle=cut_into_a)
+        self.answer(bundles, link=chain_link, decycle=cut_into_a)
+        last, _ = self.drive(link=chain_link, decycle=cut_into_a)
+        self.assertEqual(last, "DONE decisions=3 premises=3 failed_jobs=1")
+        self.assertEqual(pace.Round(str(self.plan), readonly=True).final_pass(), 2)
+        self.assertIn("unverified=3", self.verify().stdout.splitlines()[0])
+
+    def test_cycle_left_at_k_with_rooted_decisions(self):
+        """回 K に残った輪と重なれば U に入るが、前提から根に届く決定は rooted のまま。反論の段が作られたあとなら、
+        反論のジョブのある決定が対象から外れて 1 で終わる（verify は反論の段を見ないので 0）。"""
+        self.plan.write_text("# 題\n\n## 設計\n\n前提の文。\n" + "".join("決定%dを選ぶ。\n" % i for i in range(1, 8)),
+                             encoding="utf-8")
+        self.init()
+        self.drive(link=ring_premise_link, decycle=cut_first, limit=40)
+        self.assertEqual(pace.Round(str(self.plan), readonly=True).final_pass(), 6)
+        self.fail_job("decycle_5")
+        out = self.verify().stdout.splitlines()[0]
+        self.assertIn("rooted=7", out)
+        self.assertIn("unverified=0", out)
+        self.assertIn("cycles=0", out)
+        # 反論のジョブの入力を作り直せない（対象から外れた）ので、load_job の照らし合わせで止まる
+        for r in (self.next(ok=False), run("report", str(self.plan))):
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("review", r.stderr)
+            self.assertIn("init を打ち直して", r.stderr)
 
 
 class OtherPlanFlowTest(FlowBase):
