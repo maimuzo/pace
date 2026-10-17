@@ -75,7 +75,7 @@ def answer_all(bundles, labels_for=None):
     for _, _, paths in bundles:
         for p in paths:
             job = json.loads(Path(p).read_text(encoding="utf-8"))
-            if job["stage"] in ("link_r1", "link_r2"):
+            if job["stage"] in ("link_r1_1", "link_r2_1"):
                 ans = link_answer(job)
             elif job["stage"] == "classify":
                 ans = {"units": [{"uid": u["uid"], "labels": labels_for("classify", job["variant"], u["uid"])}
