@@ -1,16 +1,20 @@
-"""キャッシュの有無で結果が一致することの unittest。決まりは docs/plans/pace_design.md の9節・10節・19節。
+"""キャッシュの有無で結果が一致することの unittest。決まりは docs/plans/pace_design.md の9節・10節・15節・19節。
 
-流れは test_decycle.py の道具（FlowBase）で、テストが実行役の代わりに *.out.json を書き、init・next・report を
-subprocess で叩く。1周目のあと、プランと .pace/ をまるごと別の一時ディレクトリへ写し、写した側だけ cache/ を消して、
-同じ rounds.jsonl から始まる同じ2周目を2つ回して比べる（source.json の plan_file はファイル名だけで、jobs/ の絶対パスの
-out_path は init が jobs/ ごと消すので、写した側でも check_owner を通る）。
+流れは test_decycle.py の道具（FlowBase）で、テストが実行役の代わりに *.out.json を書き、init・next・report（限界の
+テストでは verify も）を subprocess で叩く。決定の ID はテストのプロセスの中で読むだけの Round から引く。1周目のあと、
+プランと .pace/ をまるごと別の一時ディレクトリへ写し、写した側だけ cache/ を消して、同じ rounds.jsonl から始まる同じ
+2周目を2つ回して比べる（source.json の plan_file はファイル名だけで、jobs/ の絶対パスの out_path は init が jobs/ ごと
+消すので、写した側でも check_owner を通る）。
 
 - 比べるもの（標準出力の最後の2行・report.md・fixes.md・questions.md・nodes.jsonl・rounds.jsonl の最後の行）は、
-  写した場所によらない。標準出力の FILE fixes の行とジョブファイルは絶対パスを持つので比べない。
-- 一致のテストで落ちると確かめた pace.py の壊し方は、根拠付けの鍵から candidates を抜く・裁定の鍵から text と A と B を
-  抜く・切った辺の記憶の鍵を空にする・分類の鍵から variant を抜く、の4つ。反論の鍵を決定だけに狭める壊し方と、
-  単位の本文と一緒に変わる入力（単位の ID は path と text から作るので、本文を直すと ID を持つ鍵は全部変わる）の
-  入れ忘れは、このテストでは見つけられない。
+  写した場所によらない。rounds.jsonl の行のうち run（周の印の乱数）と jobs（キャッシュの有無で違って当然）は比べず、
+  jobs は段ごとの値を別に確かめる。標準出力の FILE fixes の行とジョブファイルは絶対パスを持つので比べない。
+- 一致のテストで落ちると確かめた pace.py の壊し方は4つ。キャッシュありとなしの比べで落ちるのは、根拠付けの鍵から
+  candidates を抜く・裁定の鍵から text と A と B を抜く（nodes.jsonl が食い違う）の2つ。切った辺の記憶の鍵を空にする
+  壊し方はキャッシュなしの jobs の値で、分類の鍵から variant を抜く壊し方は1周目の PACE-STATUS の値で、はじめて落ちる
+  （jobs と1周目の値を書き直すときは、この2つの壊し方に気づけなくなることに気をつける）。反論の鍵を決定だけに狭める
+  壊し方と、単位の本文と一緒に変わる入力（単位の ID は path と text から作るので、本文を直すと ID を持つ鍵は全部
+  変わる）の入れ忘れは、このテストでは見つけられない。
 - 18節の限界の当て方: 「順1は版を見ない」は、キャッシュありとなしが同じ rounds.jsonl から始まるので両方に同じく当たる。
   「周の途中の plugin の更新」は plugin を更新しないので当たらない。「同じ周の2回目の report」は各周で report を
   1回だけ打つので当たらない。
@@ -156,7 +160,8 @@ class CacheFlowTest(FlowBase):
         self.assertEqual(cached["stdout"], ["PACE-STATUS: errors=0 failed_jobs=0 fixes=1 questions=1", "NEXT: continue"])
         for key in ("stdout", "files", "record"):
             self.assertEqual(cached[key], uncached[key], key)
-        # キャッシュありは、足した単位とその近くの分類・裁定と、決定D の根拠付けと反論だけをやり直す
+        # キャッシュありは、足した単位の分類（A と B）と裁定、決定D の根拠付けと反論だけをやり直す（分類と裁定の鍵に
+        # 前後の文は入らないので、近くの単位は分類し直さない）
         self.assertEqual(cached["jobs"], {"classify": 2, "adjudicate": 1, "link": 1, "decycle": 0, "review": 1})
         self.assertEqual(uncached["jobs"], {"classify": 6, "adjudicate": 3, "link": 5, "decycle": 1, "review": 3})
         relinked = json.loads((cached["jobs_dir"] / "link_r1_1" / "created.json").read_text())["jobs"]

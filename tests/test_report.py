@@ -215,6 +215,8 @@ class ReportFlowTest(FlowBase):
         # 2周目: 足した単位の分類の A と B、候補が変わった3つの決定の根拠付け。切った辺の記憶が回1から効いて輪が
         # できないので、輪を断つ段は0件（記憶の効かせ方を変えると、decycle と link の値が変わる）
         self.assertEqual(self.lines()[1]["jobs"], {"classify": 2, "adjudicate": 0, "link": 3, "decycle": 0, "review": 2})
+        relinked = json.loads((self.work / "jobs" / "link_r1_1" / "created.json").read_text(encoding="utf-8"))["jobs"]
+        self.assertEqual(len(relinked), 3)
 
     def test_old_line_without_jobs_is_still_read(self):
         self.round_()

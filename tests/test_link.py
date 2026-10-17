@@ -220,8 +220,9 @@ class CandidateTest(unittest.TestCase):
         nodes[0] = target
         inp = pace.select_candidates(units, nodes, target)
         size = pace.link_size(inp)
-        # 字数は指示文と入力だけを pace.dumps（indent=1）で測った長さ
-        self.assertEqual(size, len(pace.dumps({"instructions": pace.INSTRUCTIONS["link"], "input": inp})))
+        # 字数は指示文と入力だけを、ジョブファイルと同じ形（日本語をそのまま・indent=1）で測った長さ
+        self.assertEqual(size, len(json.dumps({"instructions": pace.INSTRUCTIONS["link"], "input": inp},
+                                              ensure_ascii=False, indent=1) + "\n"))
         self.assertLessEqual(size, pace.LINK_JOB_MAX_CHARS)
         # 削ったあとの余白より大きい out_path と理由を足すと、ジョブ全体は上限を超える
         room = pace.LINK_JOB_MAX_CHARS - size
@@ -612,10 +613,13 @@ class LinkFlowTest(unittest.TestCase):
         rnd = pace.Round(str(self.plan), readonly=True)
         ids = [d["id"] for d in rnd.decisions()]
         self.assertEqual(len(ids), 2)
-        # 決定1は答えが JSON のオブジェクトでない。決定2は step の to が target でも自分の claim でもない
+        # 決定1は答えが JSON のオブジェクトでない。決定2は target へ届く正しい step のほかに、from は候補のノードで
+        # 正しいが to が target でも自分の claim でもない step を持つ（to の確かめだけで落ちる）
+        node = rnd.link_input("link_r1_1", ids[1])["candidates"][0]["nodes"][0]["id"]
         broken = [(ids[0], {"answer": 5}),
                   (ids[1], {"answer": {"claims": [], "gaps": [], "need": [],
-                                       "steps": [{"from": ["P_x"], "to": "c9", "warrant": "理由"}]}})]
+                                       "steps": [{"from": [node], "to": ids[1], "warrant": "理由"},
+                                                 {"from": [node], "to": "c9", "warrant": "理由"}]}})]
         for victim, bad in broken:
             link_input = rnd.link_input("link_r1_1", victim)
             path = self.work / "cache" / (rnd.link_key(link_input) + ".json")
