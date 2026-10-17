@@ -13,7 +13,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "pace" / "scripts"))
 import pace  # noqa: E402
-from test_decycle import FlowBase, parse, run  # noqa: E402
+from test_decycle import FlowBase, link_for, parse, run  # noqa: E402
 
 # 推論で使った前提 P_1・P_3、候補として足しただけの前提 P_2、ほかの決定 D_2、claim c1
 INPUT = {"target": {"id": "D_1", "text": "t", "alternatives": ["a"], "plan_text": "p"},
@@ -114,6 +114,49 @@ class ReviewFlowTest(FlowBase):
         self.assertEqual(b["input"]["steps"][0]["id"], "s1")
         # verify は反論の段を見ない（#6 の出力のまま）
         self.assertTrue(self.verify().stdout.startswith("VERIFY decisions=3 rooted=1 needs_gap=2"))
+
+    def test_decision_with_a_gap_is_not_reviewed_and_same_questions_merge(self):
+        """C は前提から根に届くが value の gap も持つ（rooted で local）。gap があるので反論にかけない。A と同じ本文の
+        gap は questions で1項目にまとまる。"""
+        def link(job):
+            answer = link_for(job)
+            if job["input"]["target"]["plan_text"] == "決定Cを選ぶ。":
+                answer["gaps"] = [{"id": "g1", "ptype": "value", "text": "足りない前提"}]
+                answer["steps"].append({"from": ["g1"], "to": job["input"]["target"]["id"], "warrant": "別案を退ける"})
+            return answer
+        self.init()
+        last, waves = self.drive(link=link)
+        ids = self.ids()
+        self.assertEqual([j["input"]["target"]["id"] for j in self.review_jobs(waves)], [ids["決定Bを選ぶ。"]])
+        r = run("report", str(self.plan))
+        self.assertEqual(r.stdout.splitlines()[-2], "PACE-STATUS: errors=0 failed_jobs=0 fixes=0 questions=1")
+        q = (self.work / "questions.md").read_text(encoding="utf-8")
+        self.assertEqual(q.count("この gap を持つ決定"), 2)
+
+    def test_tampered_cache_answer_is_checked_again(self):
+        self.init()
+        self.drive_with_review(lambda job: {"defeaters": []})
+        for p in (self.work / "cache").rglob("*"):
+            if p.is_file() and "defeaters_answer" in p.read_text(encoding="utf-8", errors="replace"):
+                obj = json.loads(p.read_text(encoding="utf-8"))
+                obj["defeaters_answer"] = {"defeaters": [{"target": "D_x", "type": "logic", "text": "t",
+                                                          "status": "accepted", "by": []}]}
+                p.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+        r = run("report", str(self.plan))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("反論の答えがありません", r.stderr)
+
+    def test_rewritten_earlier_stage_stops_the_review_wave(self):
+        self.init()
+        for _ in range(30):
+            bundles, last = parse(self.next().stdout)
+            if any(Path(p).name.startswith("review_") for _, _, ps in bundles for p in ps):
+                break
+            self.answer(bundles)
+        (self.work / "jobs" / "link_r1_2" / "created.json").unlink()
+        r = self.next(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("反論の段の前の段が揃っていません", r.stderr)
 
     def test_verify_does_not_wait_for_review(self):
         self.init()

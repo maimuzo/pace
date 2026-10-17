@@ -2215,6 +2215,15 @@ class Round:
             jobs.append(self.new_job(REVIEW_STAGE, "%s_%s_%s" % (REVIEW_STAGE, d, rid), job_input))
         return jobs
 
+    def load_review_job(self, job_id, targets):
+        """反論のジョブを読む。load_job は入力を作り直して比べ、対象でない決定では「形が違います」で止まるので、
+        ID の決定が対象かを先に見る（review_done の (2) と run の (1b)）。"""
+        m = JOB_ID.fullmatch(job_id)
+        if m is None or m.group("review_decision") not in targets:
+            raise PaceError("%s は、いまの反論の対象の決定のものではありません（輪を断つジョブなどが書き換えられました）。"
+                            "init を打ち直してください" % self.job_path(REVIEW_STAGE, job_id))
+        return self.load_job(REVIEW_STAGE, job_id)
+
     def review_done(self, rid):
         """反論の段が済んだことを確かめる（run の DONE の前・report・show）。外れれば 1 で終わる。
 
@@ -2228,13 +2237,10 @@ class Round:
         targets = self.review_targets()
         status = {}
         for job_id in ids:
-            job = self.load_job(REVIEW_STAGE, job_id)
+            job = self.load_review_job(job_id, targets)
             d = job["input"]["target"]["id"]
             if job["status"] in ("pending", "issued"):
                 raise PaceError("反論の段にジョブが残っています。next を DONE まで回してください")
-            if d not in targets:
-                raise PaceError("%s は、いまの反論の対象の決定のものではありません（輪を断つジョブなどが書き換えられました）。"
-                                "init を打ち直してください" % self.job_path(REVIEW_STAGE, job_id))
             status[d] = job["status"]
         for d in targets:
             if status.get(d) == "failed":
@@ -2250,7 +2256,8 @@ class Round:
 
         項目は gap 1つ（questions の gap だけ、ptype と normalize した本文が同じものを1つにまとめる）・accepted か
         needs_human の反論1つ・残った輪1つ・根拠の無い決定1つ。U の決定は、悲観でも根に届いて rooted でも、その gap と
-        反論を数えず「確かめられなかったもの」に出す（性質3。U の集合と計算は #6 のまま）。refuted は数えない（根拠は前提に
+        反論を数えず「確かめられなかったもの」に出す（性質3。U の集合と計算は #6 のまま）。U の外で unverified の決定
+        （U の決定を理由にしたもの）も、同じく gap と輪を数えずにそこへ出す（その gap は verify で uncertain）。refuted は数えない（根拠は前提に
         限るので必ず根に届く）。
         """
         rid = self.round_id()
@@ -2260,11 +2267,13 @@ class Round:
         ids = a["decisions"]
         order = {d: i for i, d in enumerate(ids)}
         answers, status, u = a["answers"], a["status"], a["u"]
+        # U の外で U を理由にした決定も unverified になる（楽観は U を rooted に固定する）。どちらも失敗に左右されうる
+        unsure = set(u) | {d for d in ids if status[d] == "unverified"}
         sets = leverage_sets(ids, answers, status)
         fact_gaps, merged = [], {}
         for d in ids:
             answer = answers.get(d)
-            if d in u or answer is None:
+            if d in unsure or answer is None:
                 continue
             for g in answer["gaps"]:
                 blocked = sets.get((d, g["id"]), set())
@@ -2297,15 +2306,16 @@ class Round:
         edges = self.pass_edges(k)
         cycles = [{"kind": "cycle", "decisions": list(c),
                    "edges": [(f, t, w) for (f, t), w in sorted(edges.items(), key=lambda e: (order[e[0][0]], order[e[0][1]]))
-                             if f in c and t in c]} for c in a["cycles"]]
+                             if f in c and t in c]} for c in a["cycles"] if not set(c) & unsure]
         in_cycle = {d for c in a["cycles"] for d in c}
         ungrounded = [{"kind": "ungrounded", "decision": d} for d in ids
-                      if status[d] == "ungrounded" and d not in in_cycle and d not in u]
+                      if status[d] == "ungrounded" and d not in in_cycle and d not in unsure]
         fixes = sorted(fact_gaps, key=by_weight) + accepted + cycles + ungrounded
         questions = sorted(merged.values(), key=by_weight) + needs_human
         failed = self.failed_jobs()
         return {"pass": k, "analysis": a, "fixes": fixes, "questions": questions, "refuted": refuted,
                 "failed_jobs": failed, "u": sorted(u, key=order.get), "review_failed": review_failed,
+                "unverified": [d for d in ids if status[d] == "unverified" and d not in u],
                 "unverified_units": a["unverified_units"], "review_targets": self.review_targets(),
                 "defeaters": {"accepted": len(accepted), "refuted": len(refuted), "needs_human": len(needs_human)}}
 
@@ -2570,8 +2580,9 @@ class Round:
             except PaceError:
                 raise PaceError("反論の段の前の段が揃っていません（輪を断つジョブなどが書き換えられました）。"
                                 "init を打ち直してください")
+            targets = self.review_targets()
             for job_id in review_ids:
-                job = self.load_job(REVIEW_STAGE, job_id)
+                job = self.load_review_job(job_id, targets)
                 if job.get("status") == "issued":
                     self.judge(job)
         # (2) 段を作る: 段を前から順に見る。ジョブが残っている段で止める
@@ -2584,8 +2595,9 @@ class Round:
         if review_ids is None:
             review_ids = self.write_stage(REVIEW_STAGE, rid, self.make_review(rid))
         pending = []
+        targets = self.review_targets()
         for job_id in review_ids:
-            job = self.load_job(REVIEW_STAGE, job_id)
+            job = self.load_review_job(job_id, targets)
             if job.get("status") == "pending":
                 pending.append(job)
             elif job.get("status") == "issued":
@@ -2650,7 +2662,7 @@ def fence(text, lang, indent):
     """原文や差分をコードブロックで囲む。囲みは、中に出る backtick のいちばん長い並びより1つ長くする（3つ以上）。"""
     longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
     mark = "`" * max(3, longest + 1)
-    return [indent + mark + lang] + [(indent + line).rstrip() for line in text.split("\n")] + [indent + mark]
+    return [indent + mark + lang] + [indent + line if line else "" for line in text.split("\n")] + [indent + mark]
 
 
 def inline(text, table=False):
@@ -2721,7 +2733,7 @@ class Writer:
 
     def item(self, no, it):
         """項目1つの行。番号付きの箇条書きで、原文はコードブロック、AI の文はインラインコード。"""
-        sub = "   "
+        sub = " " * len("%d. " % no)  # 番号の本文の桁に揃える（10以上で3字だと、下の箇条書きが項目から外れる）
         if it["kind"] == "gap":
             lines = ["%d. %s: %s（止めている決定 %d件）" % (no, GAP_LABEL[it["ptype"]], inline(it["text"]), len(it["blocked"]))]
             for d in it["owners"]:
@@ -2765,6 +2777,8 @@ class Writer:
                                                           MAX_RETRIES))
         for d in f["u"]:
             out += self.decision_block(d, "失敗の影響を受けうる決定", "")
+        for d in f["unverified"]:
+            out += self.decision_block(d, "失敗の影響を受けうる決定を理由にした決定（unverified）", "")
         for d in f["review_failed"]:
             out += self.decision_block(d, "反論を確かめられなかった決定", "")
         for uid in f["unverified_units"]:
@@ -2835,6 +2849,8 @@ class Writer:
                       "見せたものかは分からない）。", ""]
         if diff_lines:
             lines += fence("\n".join(diff_lines), "diff", "")
+        elif first:
+            lines.append("基準からは変わっていません。")
         else:
             lines.append("最後に見せてから変わっていません。")
         lines += ["", "## 注意", "", SHOW_NOTE, "", BOUNDARY]

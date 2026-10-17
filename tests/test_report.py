@@ -14,7 +14,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "pace" / "scripts"))
 import pace  # noqa: E402
-from test_decycle import FlowBase, PLAN, parse, run  # noqa: E402
+from test_decycle import FlowBase, PLAN, link_for, parse, run  # noqa: E402
 
 
 def accept_b(job):
@@ -25,10 +25,25 @@ def accept_b(job):
     return {"defeaters": []}
 
 
+def u_link(job):
+    """A⇄B が輪。B は前提からも根に届き（U に入っても悲観で rooted）、A は B と事実の穴の両方を要る（悲観で needs_gap）。
+    C は A を理由にする（U の外で、楽観で rooted・悲観で needs_gap なので unverified）。どの決定も fact の gap を持つ。"""
+    target = job["input"]["target"]
+    ids = {g["plan_text"]: n["id"] for g in job["input"]["candidates"] for n in g["nodes"]}
+    froms = {"決定Aを選ぶ。": [["決定Bを選ぶ。", "g1"]], "決定Bを選ぶ。": [["決定Aを選ぶ。"], ["前提の文。"], ["g1"]],
+             "決定Cを選ぶ。": [["決定Aを選ぶ。"], ["g1"]]}[target["plan_text"]]
+    ids["g1"] = "g1"
+    steps = [{"from": [ids[t] for t in f], "to": target["id"], "warrant": "理由"} for f in froms if all(t in ids for t in f)]
+    name = target["plan_text"][2]
+    return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "%sの穴" % name}], "need": [], "steps": steps}
+
+
 class FormTest(unittest.TestCase):
     def test_fence_is_longer_than_inner_backticks(self):
         self.assertEqual(pace.fence("a ``` b", "text", "  "), ["  ````text", "  a ``` b", "  ````"])
         self.assertEqual(pace.fence("a", "diff", ""), ["```diff", "a", "```"])
+        # 行末の空白は残し（空白だけを変えた差分が見える）、空の行には字下げを付けない
+        self.assertEqual(pace.fence("-a \n\n+a", "diff", "  "), ["  ```diff", "  -a ", "", "  +a", "  ```"])
 
     def test_inline(self):
         self.assertEqual(pace.inline("a\nb\r\nc"), "`a b c`")
@@ -135,6 +150,22 @@ class ReportFlowTest(FlowBase):
         self.assertEqual(first, second)
         self.assertEqual(len(self.lines()), 1)
 
+    def test_report_twice_with_rewritten_status_keeps_the_record(self):
+        self.round_()
+        # B の反論のジョブの status を failed に書き換えると、計算し直した fixes は0になる
+        d = self.work / "jobs" / "review"
+        for job_id in json.loads((d / "created.json").read_text())["jobs"]:
+            job = json.loads((d / (job_id + ".json")).read_text(encoding="utf-8"))
+            if job["input"]["target"]["plan_text"] == "決定Bを選ぶ。":
+                job["status"] = "failed"
+                (d / (job_id + ".json")).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+        r = self.report()
+        self.assertEqual(r.stdout.splitlines()[-2:], ["PACE-STATUS: errors=0 failed_jobs=0 fixes=1 questions=1",
+                                                      "NEXT: continue"])
+        self.assertEqual(len(self.lines()), 1)
+        report = (self.work / "report.md").read_text(encoding="utf-8")
+        self.assertIn("この周の記録（failed_jobs=0 fixes=1 questions=1）と、計算し直した件数が違います", report)
+
     def test_broken_rounds_lines_are_skipped(self):
         self.round_()
         path = self.work / "rounds.jsonl"
@@ -161,6 +192,27 @@ class ReportFlowTest(FlowBase):
         self.assertIn("失敗したジョブ: decycle_1_001_", show)
         self.assertIn("失敗の影響を受けうる決定（行6）", show)
         self.assertIn("失敗の影響を受けうる決定（行7）", show)
+
+    def test_unverified_outside_u_and_rooted_u_are_not_counted(self):
+        """U の決定は悲観で rooted でも（B）、U の外で U を理由にした unverified の決定も（C）、gap を数えない。"""
+        self.init()
+        for _ in range(30):
+            bundles, last = parse(self.next().stdout)
+            if last.startswith("DONE"):
+                break
+            self.answer(bundles, link=u_link, decycle=lambda job: None)
+        v = self.verify().stdout
+        self.assertIn("rooted=1 needs_gap=0 ungrounded=0 unverified=2", v.splitlines()[0])
+        r = self.report()
+        self.assertEqual(r.stdout.splitlines()[-2:], ["PACE-STATUS: errors=0 failed_jobs=1 fixes=0 questions=0",
+                                                      "NEXT: show"])
+        self.show()
+        show = (self.work / "show.md").read_text(encoding="utf-8")
+        for text in ("Aの穴", "Bの穴", "Cの穴"):
+            self.assertNotIn(text, show)
+        self.assertIn("失敗の影響を受けうる決定（行6）", show)
+        self.assertIn("失敗の影響を受けうる決定（行7）", show)
+        self.assertIn("失敗の影響を受けうる決定を理由にした決定（unverified）（行8）", show)
 
     def test_failed_classify_units_are_listed(self):
         self.plan.write_text("# 題\n\n## 設計\n\n前提の文。\n決定Aを選ぶ。\n\n## 別\n\n別の前提の文。\n", encoding="utf-8")
@@ -216,6 +268,8 @@ class ReportFlowTest(FlowBase):
                      "## 最後に見せてからの差分", "## 注意"):
             self.assertIn(head, text)
         self.assertIn("初回（まだ人間に見せていない基準", text)
+        self.assertIn("基準からは変わっていません。", text)
+        self.assertNotIn("最後に見せてから変わっていません", text)
         self.assertEqual((self.work / "show_snapshot.md").read_bytes(), self.plan.read_bytes())
 
     def test_shown_moves_the_base_and_diff_follows(self):
@@ -257,6 +311,33 @@ class ReportFlowTest(FlowBase):
         self.assertIn("消してから init", r.stderr)
         self.assertEqual(other.read_text(encoding="utf-8"), "外")
 
+    def test_shown_checks_the_work_directory(self):
+        """.pace が symlink なら、shown は外を指す shown.md も rounds.jsonl も変えずに 1 で終わる（性質2）。"""
+        self.round_()
+        sha = self.show().stdout.splitlines()[-1].split()[1]
+        moved = self.dir / "moved"
+        os.rename(str(self.dir / ".pace"), str(moved))
+        os.symlink(str(moved), str(self.dir / ".pace"))
+        before = {p: (moved / "plan" / p).read_bytes() for p in ("shown.md", "rounds.jsonl")}
+        r = run("shown", str(self.plan), sha)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual({p: (moved / "plan" / p).read_bytes() for p in before}, before)
+        self.assertTrue((moved / "plan" / "show_snapshot.md").exists())
+
+    def test_show_stops_on_a_snapshot_directory(self):
+        self.round_()
+        (self.work / "show_snapshot.md").mkdir()
+        r = self.show(ok=False)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ディレクトリです。消してから", r.stderr)
+
+    def test_backticks_in_the_plan_get_a_longer_fence(self):
+        self.plan.write_text(PLAN.replace("決定Cを選ぶ。", "決定Cを選ぶ（```を含む）。"), encoding="utf-8")
+        self.round_()
+        self.show()
+        show = (self.work / "show.md").read_text(encoding="utf-8")
+        self.assertIn("     ````text\n     決定Cを選ぶ（```を含む）。\n     ````", show)
+
     def test_init_recreated_base_is_first_time(self):
         self.round_()
         self.show_and_shown()
@@ -264,7 +345,9 @@ class ReportFlowTest(FlowBase):
         self.edit(1)
         self.round_()
         self.show()
-        self.assertIn("初回（", (self.work / "show.md").read_text(encoding="utf-8"))
+        show = (self.work / "show.md").read_text(encoding="utf-8")
+        self.assertIn("初回（", show)
+        self.assertNotIn("最後に見せてから変わっていません", show)
 
     def test_show_needs_review_done_and_shown_md(self):
         self.init()

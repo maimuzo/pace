@@ -572,10 +572,10 @@ class RewrittenDecycleJobTest(FlowBase):
         self.assertIn("rooted=7", out)
         self.assertIn("unverified=0", out)
         self.assertIn("cycles=0", out)
-        # 反論のジョブの入力を作り直せない（対象から外れた）ので、load_job の照らし合わせで止まる
+        # 反論のジョブのある決定が対象から外れたので、ジョブを読む前に止まる
         for r in (self.next(ok=False), run("report", str(self.plan))):
             self.assertEqual(r.returncode, 1)
-            self.assertIn("review", r.stderr)
+            self.assertIn("いまの反論の対象の決定のものではありません", r.stderr)
             self.assertIn("init を打ち直して", r.stderr)
 
 
