@@ -204,6 +204,29 @@ class ReportFlowTest(FlowBase):
         self.assertEqual([x["round"] for x in self.lines()], [1, 2])
         self.assertNotIn("壊れた行", path.read_text(encoding="utf-8"))
 
+    # --- やり直したジョブの数（19節） ----------------------------------------
+
+    def test_jobs_are_counted_per_stage_kind(self):
+        self.round_()
+        # 1周目: 分類は節（「# 題」と「## 設計」）ごと・A と B ごとに4ジョブ。A⇄B の輪を断ち、A を回2で根拠付けし直す
+        self.assertEqual(self.lines()[0]["jobs"], {"classify": 4, "adjudicate": 0, "link": 4, "decycle": 1, "review": 2})
+        self.edit(1)
+        self.round_()
+        # 2周目: 足した単位の分類の A と B、候補が変わった3つの決定の根拠付け。切った辺の記憶が回1から効いて輪が
+        # できないので、輪を断つ段は0件（記憶の効かせ方を変えると、decycle と link の値が変わる）
+        self.assertEqual(self.lines()[1]["jobs"], {"classify": 2, "adjudicate": 0, "link": 3, "decycle": 0, "review": 2})
+
+    def test_old_line_without_jobs_is_still_read(self):
+        self.round_()
+        path = self.work / "rounds.jsonl"
+        old = self.lines()[0]
+        del old["jobs"]
+        path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+        self.edit(1)
+        self.round_()
+        # jobs の無い行（この版より前の report の行）も読み飛ばさずに数える
+        self.assertEqual([("jobs" in x, x["since_shown"]) for x in self.lines()], [(False, 1), (True, 2)])
+
     # --- 失敗したジョブ（性質3） --------------------------------------------
 
     def test_failed_jobs_are_not_fixes_or_questions(self):
