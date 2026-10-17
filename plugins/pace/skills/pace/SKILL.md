@@ -1,6 +1,6 @@
 ---
 name: pace
-description: 設計プランの根拠を辿る PACE を回す。いまはプランを単位に分け、AI のジョブ（分類・裁定）を束にして subagent へ渡し、決定と前提のノードを作るところまで。根拠付けと周の回し方は後の版で足す。
+description: 設計プランの根拠を辿る PACE を回す。いまはプランを単位に分け、AI のジョブ（分類・裁定・根拠付け）を束にして subagent へ渡し、決定と前提のノードを作り、決定ごとに根拠付けをするところまで。輪を断つ・結合と周の回し方は後の版で足す。
 allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)
 ---
 
@@ -34,7 +34,7 @@ allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)
    ```
 
    - 0 以外で終わったら、標準エラーをそのまま見せて止まります。
-   - `DONE` で始まる行が出たら、その行を見せて止まります（決定と前提の数、失敗したジョブの数です）。
+   - `DONE` で始まる行が出たら、その行を見せて止まります（決定と前提の数、失敗したジョブの数です。決定ごとの根拠付けまで終わっています）。
 
 3. `next` の出力は、束ごとに `BUNDLE <束の ID> <agent>` の行と、そのあとに続く `JOB <ジョブファイルの絶対パス>` の行です（`JOB ` のあとの行の残り全部が1つのパスです）。束ごとに Agent を1回呼びます。
    - `subagent_type` は、`BUNDLE` の行の agent（`pace:pace-worker` か `pace:pace-judge`）にします。model は渡しません。
@@ -55,4 +55,4 @@ allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/pace.py" *)
 
 - 束は必ず subagent に渡し、全部の結果が返ってから次の `next` を打ちます。答えのファイル（`*.out.json`）を自分で書いたり直したりしません。答えの無いジョブは、`next` が差し戻しの1回に数えます。
 - `next` の出力に無いファイル（作業ディレクトリの中のほかのジョブや答え）を開きません。
-- 周の回し方（`report`・`show`・`shown`、直すものと人間に訊くものの返し方）は後の版（maimuzo/pace#7）で書きます。いまの版は `DONE` で止まります。
+- 輪を断つ・結合（maimuzo/pace#6）と、周の回し方（`report`・`show`・`shown`、直すものと人間に訊くものの返し方。maimuzo/pace#7）は後の版で書きます。いまの版は、根拠付けまで終えた `DONE` で止まります。

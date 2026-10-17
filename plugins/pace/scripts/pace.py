@@ -2,10 +2,12 @@
 """PACE の機械の仕事を受け持つスクリプト。
 
 いまは --version（段ごとの版の一覧）と init（プランを単位に分けて作業ディレクトリに置く）と
-next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化まで）を持つ。
-verify・report・show・shown は後の issue（maimuzo/pace#5 以降）で足す。
+next（AI に頼むジョブを束にして出し、答えを検証して取り込む。分類・比較・裁定・ノード化と、
+候補の絞り込み・根拠付け r1・2-gram の追加候補・根拠付け r2 まで）を持つ。
+verify・report・show・shown は後の issue（maimuzo/pace#6 以降）で足す。
 Python 3.9 以上・標準ライブラリだけで動かす。分割と作業ディレクトリの決まりは
-docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは14節（ジョブと束）にある。
+docs/plans/pace_design.md の4節（入力）と9節（作業ディレクトリ）、next の決まりは14節（ジョブと束）、
+根拠付けの決まりは15節（根拠付け）にある。
 """
 
 import argparse
@@ -576,11 +578,33 @@ JOB_MAX_CHARS = 20000
 BUNDLE_MAX_CHARS = 60000
 BUNDLE_MAX_JOBS = 20
 PARALLEL = 4  # 1つの波に出す束の数の上限
+# 根拠付けのジョブと束の大きさ。subagent の Read は1回に25,000トークンまでで、候補の形の JSON は
+# 約0.57トークン/字だった（44,333字は1回で読め、53,526字は切れた。15節）。束は #9 で測り直す
+LINK_JOB_MAX_CHARS = 40000
+LINK_BUNDLE_MAX_CHARS = 120000
+# 候補の絞り込みと追加候補の定数（docs/idea.md 付録B）
+WINDOW = 5
+MAX_CANDIDATES = 80
+EXPAND_PER_NEED = 6
+EXPAND_MAX = 12
 
 AGENTS_DIR = Path(__file__).resolve().parent.parent / "agents"
-STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge"}
-JOB_STAGES = ("classify", "adjudicate")
+STAGE_AGENT = {"classify": "pace-worker", "adjudicate": "pace-judge", "link": "pace-worker"}
+JOB_STAGES = ("classify", "adjudicate", "link_r1", "link_r2")
+# ノードを作る段（ここの失敗だけが、ノードの無い単位になる）
+NODE_STAGES = ("classify", "adjudicate")
 PTYPES = ("fact", "requirement", "value")
+
+
+def stage_kind(stage):
+    """ジョブの段（link_r1・link_r2）を、版・指示文・agent・キャッシュの鍵の段の名前（link）に寄せる。"""
+    return "link" if stage in ("link_r1", "link_r2") else stage
+
+
+def bundle_limits(stage):
+    if stage_kind(stage) == "link":
+        return LINK_BUNDLE_MAX_CHARS, BUNDLE_MAX_JOBS
+    return BUNDLE_MAX_CHARS, BUNDLE_MAX_JOBS
 
 # 段の指示文。docs/idea.md 付録A の全文に、code_line（コードの1行）を足し、裁定には文脈を確かめる1文を足したもの。
 # 変えるとキャッシュの鍵（指示文の sha256）が変わるので、古い答えは使われない。出力の形を変えたら段の版も上げる
@@ -596,6 +620,21 @@ input.units のすべての uid を、過不足なく1回ずつ出すこと。""
 基準: decision = プランが選んでいて、別の選び方があり、選び方で振る舞いや作り方が変わるもの（1単位に複数あれば分ける）。premise = 決定ではない前提で、ptype は fact / requirement / value。どちらでもなければ空。迷ったら拾う側に倒す。
 section_path と neighbors で文脈を確かめること。
 出力は JSON: {"labels":[{"kind":"decision","text":"...","alternatives":["..."]} | {"kind":"premise","ptype":"fact","text":"..."}]}""",
+    # docs/idea.md 付録A の [link] の全文に、gaps を必ず from に入れる規則（実験時に依頼文で足していたもの。
+    # docs/idea.md:633 が指示文に入れるよう勧めている）と、入力の形の説明3文を足したもの
+    "link": """設計プランの1つの決定（input.target）について、それを支える理由を input.candidates の中から探し、推論の段（step）として書け。
+規則:
+1. input.candidates はプランの単位ごとのまとまりで、plan_text がプランの原文、nodes がその単位から取り出した決定・前提である。根拠の葉は nodes の id だけ。candidates に無いことを根拠にしてはならない。candidates の他の決定（kind=decision）も根拠に使ってよい。
+2. 必要なのに candidates に無い前提は gaps に書く（ptype は fact / requirement / value）。でっち上げやこじつけは禁止。根拠が無いなら gap で示すのが正しい結果である。
+3. step は小さく保ち、間に claims を挟んでよい。warrant に「なぜこの前提からこの結論が導けるか」を書く。
+4. target.alternatives を退ける理由まで根拠付ける。退ける理由が無ければ gap にする。
+5. candidates に無いが、プランの別の箇所に書かれていそうな前提や決定があれば、need に「探してほしい内容」を短く書く（無ければ空）。
+claims と gaps の id は c1, c2, ... / g1, g2, ... とする。step の to は target.id か claims の id。
+出力は JSON: {"claims":[{"id":"c1","text":"..."}],"gaps":[{"id":"g1","ptype":"fact","text":"..."}],"steps":[{"from":["..."],"to":"...","warrant":"..."}],"need":["..."]}
+input.previous があれば、それは前回のあなたの結果である。追加された candidates を使って全体を書き直せ。
+gaps に書いたものは必ずどれかの step の from に入れること。
+nodes の kind は decision か、前提の種類（fact / requirement / value）である。plan_text はコードブロックの1行のこともある。
+input.added は、追加された candidates のノードの id である。""",
 }
 
 
@@ -651,6 +690,10 @@ def valid_job(obj):
             and isinstance(obj.get("input"), dict)
             and obj.get("status") in ("pending", "issued", "done", "failed")):
         return False
+    if stage_kind(obj["stage"]) == "link":
+        # 入力そのものは load_job が、プランとキャッシュから作り直したものと突き合わせる
+        target = obj["input"].get("target")
+        return isinstance(target, dict) and isinstance(target.get("id"), str)
     if obj["stage"] == "classify":
         units = obj["input"].get("units")
         return isinstance(units, list) and bool(units) and all(
@@ -670,7 +713,8 @@ def encodable(text):
 
 # 作業ディレクトリのファイルから読んでパスに使う名前の形。ほかの形（`../` を含むものなど）は形の誤りとして断る
 ROUND_ID = re.compile(r"[0-9a-f]{8}")
-JOB_ID = re.compile(r"(?:classify_([AB])_[0-9]{3,}|adjudicate_(u[0-9a-f]{8}(?:_[0-9]+)?))_[0-9a-f]{8}")
+JOB_ID = re.compile(r"(?:classify_([AB])_[0-9]{3,}|adjudicate_(u[0-9a-f]{8}(?:_[0-9]+)?)"
+                    r"|link_r[12]_(D_[0-9a-f]{8}(?:_[0-9]+)?_[0-9]+))_[0-9a-f]{8}")
 
 # 差し戻しの理由1件の長さの上限。理由はジョブファイルに溜まるので、長いとジョブが Read の上限を超える
 ERROR_MAX_CHARS = 300
@@ -742,6 +786,259 @@ def counts(labels):
     return (sum(1 for x in labels if x["kind"] == "decision"), sum(1 for x in labels if x["kind"] == "premise"))
 
 
+CLAIM_ID = re.compile(r"c[0-9]+")
+GAP_ID = re.compile(r"g[0-9]+")
+
+
+def nonempty_text(value, where):
+    if not isinstance(value, str) or not value.strip() or not encodable(value):
+        raise ValueError("%s が空でない文字列ではありません（UTF-8 で書けない字も含めない）" % where)
+    return value
+
+
+def check_link(answer, link_input):
+    """根拠付けの答えを、作り直した入力に照らして確かめ、知らないキーを捨てたものを返す。誤りは ValueError。
+
+    検証は docs/idea.md 段4 の6つに、from が空でないこと・id の形・UTF-8 で書けることを足したもの（15節）。
+    """
+    if not isinstance(answer, dict):
+        raise ValueError("答えが JSON のオブジェクトではありません")
+    target = link_input["target"]["id"]
+    candidates = {n["id"] for g in link_input["candidates"] for n in g["nodes"]}
+    lists = {}
+    for key in ("claims", "gaps", "steps", "need"):
+        value = answer.get(key, [])
+        if not isinstance(value, list):
+            raise ValueError('"%s" が配列ではありません' % key)
+        lists[key] = value
+    claims, gaps = [], []
+    seen = set()
+    for key, pattern, out in (("claims", CLAIM_ID, claims), ("gaps", GAP_ID, gaps)):
+        for item in lists[key]:
+            if not isinstance(item, dict):
+                raise ValueError('"%s" の要素がオブジェクトではありません' % key)
+            cid = item.get("id")
+            if not isinstance(cid, str) or not pattern.fullmatch(cid):
+                raise ValueError('"%s" の id が %s の形ではありません: %r'
+                                 % (key, "c<数>" if key == "claims" else "g<数>", cid))
+            if cid in seen:
+                raise ValueError("id が2回あります: %s" % cid)
+            seen.add(cid)
+            entry = {"id": cid}
+            if key == "gaps":
+                if item.get("ptype") not in PTYPES:
+                    raise ValueError("gap %s の ptype が fact / requirement / value のどれでもありません" % cid)
+                entry["ptype"] = item["ptype"]
+            entry["text"] = nonempty_text(item.get("text"), "%s の text" % cid)
+            out.append(entry)
+    claim_ids = {c["id"] for c in claims}
+    gap_ids = {g["id"] for g in gaps}
+    allowed_from = candidates | claim_ids | gap_ids
+    steps = []
+    used = set()
+    for k, step in enumerate(lists["steps"], start=1):
+        where = "step %d" % k
+        if not isinstance(step, dict):
+            raise ValueError("%s がオブジェクトではありません" % where)
+        froms = step.get("from")
+        if not isinstance(froms, list) or not froms or not all(isinstance(f, str) for f in froms):
+            raise ValueError("%s の from が、空でない文字列の配列ではありません" % where)
+        bad = [f for f in froms if f not in allowed_from]
+        if bad:
+            raise ValueError("%s の from に、候補のノード・自分の claims・gaps のどれでもない id があります: %s"
+                             % (where, ", ".join(repr(b) for b in bad)))
+        to = step.get("to")
+        if to != target and to not in claim_ids:
+            raise ValueError("%s の to が target.id か claims の id ではありません: %r" % (where, to))
+        if to in froms:
+            raise ValueError("%s の from に to が入っています（自己参照）: %s" % (where, to))
+        warrant = nonempty_text(step.get("warrant"), "%s の warrant" % where)
+        used.update(froms)
+        steps.append({"from": list(froms), "to": to, "warrant": warrant})
+    if not any(s["to"] == target for s in steps):
+        raise ValueError("to が target.id（%s）の step がありません" % target)
+    unused = [g for g in sorted(gap_ids) if g not in used]
+    if unused:
+        raise ValueError("どの step の from にも使われていない gap があります: %s" % ", ".join(unused))
+    need = []
+    for k, item in enumerate(lists["need"], start=1):
+        if not isinstance(item, str) or not encodable(item):
+            raise ValueError("need の %d 件目が文字列ではありません（UTF-8 で書けない字も含めない）" % k)
+        if item.strip():
+            need.append(item)
+    return {"claims": claims, "gaps": gaps, "steps": steps, "need": need}
+
+
+# ---------------------------------------------------------------------------
+# 候補の絞り込みと 2-gram の追加候補（docs/idea.md 段3・段4a。決まりは15節）
+# ---------------------------------------------------------------------------
+
+def h2_blocks(units):
+    """単位ごとに、属する H2 の塊の番号を返す。sec が変わるところと、H2 の見出しの単位で区切る。
+
+    同じ題名の H2 が2つあっても、位置で別の塊にする。H3 の見出しは path の末尾が sec になるので区切らない。
+    """
+    blocks = []
+    b = 0
+    prev = None
+    for u in units:
+        h2 = u["kind"] == "heading" and u["sec"] and u["text"] == u["sec"] and (not u["path"] or u["path"][-1] != u["sec"])
+        if blocks and (h2 or u["sec"] != prev):
+            b += 1
+        blocks.append(b)
+        prev = u["sec"]
+    return blocks
+
+
+def identifiers(text):
+    """単位の本文の backtick の中身（前後の backtick と空白を落としたもの）の集合。"""
+    # 閉じの無い backtick があっても、閉じた範囲だけは識別子として拾う
+    spans, _ = code_spans(text)
+    out = set()
+    for start, end in spans:
+        inner = text[start:end].strip("`").strip()
+        if inner:
+            out.add(inner)
+    return out
+
+
+def node_entry(node):
+    return {"id": node["id"], "kind": "decision" if node["kind"] == "decision" else node["ptype"], "text": node["text"]}
+
+
+def link_size(job_input):
+    """ジョブの字数。out_path・差し戻しの理由を入れず、指示文と入力だけで測る（パスや差し戻しで候補を変えない）。"""
+    return len(dumps({"instructions": INSTRUCTIONS["link"], "input": job_input}))
+
+
+def select_candidates(units, nodes, decision):
+    """決定1件の r1 の入力を作る。
+
+    同じ H2 の塊・前後5単位・冒頭の節・識別子の共有のどれかに当たる単位のノードを、位置の近い単位から
+    単位ごとに丸ごと入れ、80ノードを超える単位の手前で止める。ジョブが40,000字を超えたら遠い単位から削る。
+    """
+    pos = {u["id"]: i for i, u in enumerate(units)}
+    by_unit = {}
+    for n in nodes:
+        by_unit.setdefault(n["unit"], []).append(n)
+    blocks = h2_blocks(units)
+    h2_positions = [i for i, u in enumerate(units)
+                    if u["kind"] == "heading" and u["sec"] and u["text"] == u["sec"]
+                    and (not u["path"] or u["path"][-1] != u["sec"])]
+    opening = blocks[h2_positions[0]] if h2_positions else None
+    t = pos[decision["unit"]]
+    t_ids = identifiers(units[t]["text"])
+    picked = []
+    for i, u in enumerate(units):
+        unit_nodes = [n for n in by_unit.get(u["id"], []) if n["id"] != decision["id"]]
+        if not unit_nodes:
+            continue
+        if (blocks[i] == blocks[t] or abs(i - t) <= WINDOW or opening is None or blocks[i] <= opening
+                or (t_ids and t_ids & identifiers(u["text"]))):
+            picked.append((abs(i - t), i, unit_nodes))
+    picked.sort(key=lambda x: (x[0], x[1]))
+    groups = []
+    total = 0
+    for _, i, unit_nodes in picked:
+        if total + len(unit_nodes) > MAX_CANDIDATES:
+            break
+        total += len(unit_nodes)
+        groups.append({"section": units[i]["sec"], "plan_text": units[i]["text"],
+                       "nodes": [node_entry(n) for n in unit_nodes]})
+    tu = units[t]
+    job_input = {"target": {"id": decision["id"], "text": decision["text"], "alternatives": decision["alternatives"],
+                            "section": tu["sec"], "plan_text": tu["text"]},
+                 "candidates": groups}
+    while groups and link_size(job_input) > LINK_JOB_MAX_CHARS:
+        groups.pop()
+    return job_input
+
+
+def bigrams(text):
+    """空白を落とし ASCII を小文字にした文字の2-gram の出現回数。"""
+    s = "".join(c.lower() if c.isascii() else c for c in text if not c.isspace())
+    out = {}
+    for k in range(len(s) - 1):
+        g = s[k:k + 2]
+        out[g] = out.get(g, 0) + 1
+    return out
+
+
+def cosine(a, b):
+    if not a or not b:
+        return 0.0
+    if len(a) > len(b):
+        a, b = b, a
+    dot = sum(v * b.get(k, 0) for k, v in a.items())
+    if not dot:
+        return 0.0
+    na = sum(v * v for v in a.values()) ** 0.5
+    nb = sum(v * v for v in b.values()) ** 0.5
+    return dot / (na * nb)
+
+
+def expand_candidates(units, nodes, decision, r1_input, r1_answer, vectors=None):
+    """r1 の答えの need から 2-gram で近いノードを選び、r2 の入力を作る。足すものが無ければ None。
+
+    need 1件につき6件・合計12件まで。同点は決定に位置の近い単位・前の単位・単位の中のノードの順。
+    r2 のジョブが40,000字を超えたら、足したものを類似度の低い順に削る。
+    vectors はノードの id から 2-gram へのキャッシュ（同じ next の中で使い回す）。
+    """
+    need = r1_answer["need"]
+    pos = {u["id"]: i for i, u in enumerate(units)}
+    texts = {u["id"]: u["text"] for u in units}
+    have = {n["id"] for g in r1_input["candidates"] for n in g["nodes"]} | {decision["id"]}
+    t = pos[decision["unit"]]
+    pool = []
+    for order, n in enumerate(nodes):
+        if n["id"] in have:
+            continue
+        if vectors is not None and n["id"] in vectors:
+            vec = vectors[n["id"]]
+        else:
+            vec = bigrams(n["text"] + texts[n["unit"]])
+            if vectors is not None:
+                vectors[n["id"]] = vec
+        pool.append((abs(pos[n["unit"]] - t), pos[n["unit"]], order, n, vec))
+    added = []
+    chosen = set()
+    for item in need:
+        if len(added) >= EXPAND_MAX:
+            break
+        q = bigrams(item)
+        scored = [(-cosine(q, vec), d, p, o, n) for d, p, o, n, vec in pool if n["id"] not in chosen]
+        scored = [s for s in scored if s[0] < 0]
+        scored.sort(key=lambda s: s[:4])
+        for s in scored[:EXPAND_PER_NEED]:
+            if len(added) >= EXPAND_MAX:
+                break
+            chosen.add(s[4]["id"])
+            added.append((-s[0], s[4]))
+    while added:
+        job_input = r2_input(units, r1_input, [n for _, n in added], r1_answer)
+        if link_size(job_input) <= LINK_JOB_MAX_CHARS:
+            return job_input
+        # 類似度のいちばん低いものを削る（同じ類似度なら後に足したもの）
+        low = min(range(len(added)), key=lambda k: (added[k][0], -k))
+        del added[low]
+    return None
+
+
+def r2_input(units, r1_input, added, previous):
+    """r1 の入力に、足したノード（同じ単位のまとまりがあればそこへ、無ければ後ろに）と added・previous を足す。"""
+    texts = {u["id"]: (u["sec"], u["text"]) for u in units}
+    groups = [dict(g, nodes=list(g["nodes"])) for g in r1_input["candidates"]]
+    new_groups = {}
+    for n in added:
+        if n["unit"] not in new_groups:
+            sec, text = texts[n["unit"]]
+            new_groups[n["unit"]] = {"section": sec, "plan_text": text, "nodes": []}
+            groups.append(new_groups[n["unit"]])
+        new_groups[n["unit"]]["nodes"].append(node_entry(n))
+    return {"target": r1_input["target"], "candidates": groups, "added": [n["id"] for n in added],
+            "previous": previous}
+
+
 class Round:
     """1回の next が扱う、1つのプランの作業ディレクトリ。"""
 
@@ -796,6 +1093,10 @@ class Round:
         source = self.work / "source.json"
         self.plan_file = load_work_json(source)["plan_file"] if os.path.lexists(str(source)) else self.plan.name
         self.agent_sha = {}
+        # 同じ next の中で使い回すもの（ノード・根拠付けの入力・ノードの 2-gram）。答えを取り込んだら作り直す
+        self._nodes = None
+        self._link_inputs = {}
+        self._vectors = {}
 
     # --- 鍵とキャッシュ ---------------------------------------------------
 
@@ -824,9 +1125,14 @@ class Round:
         return self.cache_key("adjudicate", {"kind": unit["kind"], "section_path": unit["path"],
                                              "text": unit["text"], "A": a, "B": b})
 
-    def cache_get(self, key):
+    def link_key(self, link_input):
+        # 鍵の入力は、プランとキャッシュから作り直した入力の全体（決定・候補・r2 なら added と previous）
+        return self.cache_key("link", link_input)
+
+    def cache_get(self, key, link_input=None):
         """キャッシュの答え。無いか、読めないか、形が違えば None（その単位はジョブを作り直し、cache_put が上書きする）。
 
+        分類と裁定は {"labels": [...]}、根拠付けは {"answer": {...}} で、根拠付けはいまの入力に照らして確かめ直す。
         cache/ は init が残すので、壊れたものに「init を打ち直して」と案内しても直らない。
         """
         path = self.cache_dir / (key + ".json")
@@ -834,13 +1140,15 @@ class Round:
             return None
         try:
             obj = json.loads(read_regular(path).decode("utf-8"))
+            if link_input is not None:
+                return check_link(obj["answer"], link_input)
             return check_labels(obj["labels"], key)
         except (OSError, ValueError, RecursionError, TypeError, KeyError):
             return None
 
-    def cache_put(self, key, labels):
+    def cache_put(self, key, labels=None, answer=None):
         make_private_dir(self.cache_dir)
-        write_json(self.cache_dir / (key + ".json"), {"labels": labels})
+        write_json(self.cache_dir / (key + ".json"), {"labels": labels} if answer is None else {"answer": answer})
 
     # --- ジョブ -----------------------------------------------------------
 
@@ -892,7 +1200,12 @@ class Round:
         if m is None:  # created() が先に断るので、ここは二重の守り
             raise PaceError("%s の名前の形が違います。init を打ち直してください" % path)
         job = load_work_json(path, lambda o: valid_job(o) and o["stage"] == stage)
-        if stage == "classify":
+        if stage_kind(stage) == "link":
+            # 根拠付けの入力は、プランとキャッシュから作り直したものと同じでなければならない
+            # （ジョブファイルは Edit(**/.pace/**) で書き換えられうるので、検証の照らし先にしない）
+            ok = (m.group(3) is not None and job["input"]["target"]["id"] == m.group(3)
+                  and job["input"] == self.link_input(stage, m.group(3)))
+        elif stage == "classify":
             uids = [u["uid"] for u in job["input"]["units"]]
             ok = m.group(1) is not None and all(u in self.pos for u in uids) and len(set(uids)) == len(uids)
         else:
@@ -911,7 +1224,8 @@ class Round:
             job["variant"] = variant
         # cache_key は idea.md 6.4 の形に合わせて空で持つ。鍵は判定のときに単位とキャッシュから作り直す
         job.update({"cache_key": "",
-                "prompt_version": dict(STAGE_VERSIONS)[stage], "instructions": INSTRUCTIONS[stage],
+                "prompt_version": dict(STAGE_VERSIONS)[stage_kind(stage)],
+                "instructions": INSTRUCTIONS[stage_kind(stage)],
                 "input": job_input, "out_path": str((d / (job_id + ".out.json")).absolute()),
                 "attempts": 0, "previous_errors": [], "status": "pending"})
         return job
@@ -984,12 +1298,22 @@ class Round:
         return out
 
     def failed_units(self):
+        """ノードの無い単位。分類と裁定の段だけを読む。
+
+        根拠付けの失敗ではノードを消さない（消すとほかの決定の候補が変わり、根拠付けが連鎖してやり直しになる）。
+        根拠付けの load_job は nodes() を呼ぶので、ここで根拠付けの段を読むと再帰する。
+        """
+        rid = self.round_id()
         out = set()
-        for job in self.failed_jobs():
-            if job["stage"] == "classify":
-                out.update(u["uid"] for u in job["input"]["units"])
-            else:
-                out.add(job["input"]["unit"]["uid"])
+        for stage in NODE_STAGES:
+            for job_id in self.created(stage, rid) or []:
+                job = self.load_job(stage, job_id)
+                if job["status"] != "failed":
+                    continue
+                if stage == "classify":
+                    out.update(u["uid"] for u in job["input"]["units"])
+                else:
+                    out.add(job["input"]["unit"]["uid"])
         return out
 
     def classified(self, unit):
@@ -1012,6 +1336,75 @@ class Round:
             jobs.append(self.new_job("adjudicate", "adjudicate_%s_%s" % (unit["id"], rid), job_input))
         return jobs
 
+    # --- 根拠付け -----------------------------------------------------------
+
+    def node_list(self):
+        """ノード。nodes.jsonl を読まず、キャッシュから作り直す（同じ next の中では使い回す）。"""
+        if self._nodes is None:
+            self._nodes = self.nodes()
+        return self._nodes
+
+    def decisions(self):
+        return [n for n in self.node_list() if n["kind"] == "decision"]
+
+    def link_input(self, stage, decision_id):
+        """根拠付けの入力を、プランとキャッシュから作り直す。作れない（決定が無い・r2 を作らない）ときは None。"""
+        memo_key = (stage, decision_id)
+        if memo_key in self._link_inputs:
+            return self._link_inputs[memo_key]
+        nodes = self.node_list()
+        decision = next((n for n in nodes if n["id"] == decision_id and n["kind"] == "decision"), None)
+        result = None
+        if decision is not None:
+            r1 = select_candidates(self.units, nodes, decision)
+            if stage == "link_r1":
+                result = r1
+            else:
+                answer = self.cache_get(self.link_key(r1), r1)
+                if answer is not None and answer["need"]:
+                    result = expand_candidates(self.units, nodes, decision, r1, answer, self._vectors)
+        self._link_inputs[memo_key] = result
+        return result
+
+    def make_link(self, stage, rid):
+        """決定ごとに、キャッシュに答えの無いものだけ根拠付けのジョブを作る（r2 は追加の候補がある決定だけ）。"""
+        jobs = []
+        for d in self.decisions():
+            job_input = self.link_input(stage, d["id"])
+            if job_input is None or self.cache_get(self.link_key(job_input), job_input) is not None:
+                continue
+            jobs.append(self.new_job(stage, "%s_%s_%s" % (stage, d["id"], rid), job_input))
+        return jobs
+
+    def check_link_coverage(self):
+        """DONE の前に、どの決定にも r1 の答え（r2 を作る決定は r2 の答え）か、失敗したジョブがあるかを確かめる。"""
+        rid = self.round_id()
+        failed = set()
+        for stage in ("link_r1", "link_r2"):
+            for job_id in self.created(stage, rid) or []:
+                job = self.load_job(stage, job_id)
+                if job["status"] == "failed":
+                    failed.add(job["input"]["target"]["id"])
+        for d in self.decisions():
+            if d["id"] in failed:
+                continue
+            for stage in ("link_r1", "link_r2"):
+                job_input = self.link_input(stage, d["id"])
+                if job_input is None:
+                    if stage == "link_r1":
+                        raise PaceError("決定 %s の根拠付けの入力を作れません。init を打ち直してください" % d["id"])
+                    continue
+                if self.cache_get(self.link_key(job_input), job_input) is None:
+                    raise PaceError("決定 %s の根拠付けの答えがありません。init を打ち直してください" % d["id"])
+
+    def link_answer(self, decision_id):
+        """決定の根拠付けの答え（r2 を作った決定は r2、無ければ r1）。無ければ None。後の段とテストが使う。"""
+        for stage in ("link_r2", "link_r1"):
+            job_input = self.link_input(stage, decision_id)
+            if job_input is not None:
+                return self.cache_get(self.link_key(job_input), job_input)
+        return None
+
     # --- 判定 -------------------------------------------------------------
 
     def judge(self, job):
@@ -1027,17 +1420,29 @@ class Round:
                 answer = json.loads(read_regular(out).decode("utf-8"))
                 if not isinstance(answer, dict):
                     raise ValueError("答えが JSON のオブジェクトではありません")
-                result = check_classify(answer, job) if stage == "classify" else check_adjudicate(answer, job)
+                if stage_kind(stage) == "link":
+                    # load_job が、ジョブの入力をプランとキャッシュから作り直したものと同じと確かめてある
+                    result = check_link(answer, job["input"])
+                elif stage == "classify":
+                    result = check_classify(answer, job)
+                else:
+                    result = check_adjudicate(answer, job)
             except (OSError, ValueError, RecursionError) as e:
                 error = "答えが検証に落ちました: %s" % e
         path = self.job_path(stage, job["job_id"])
         if error is None:
             # キャッシュに書いてから done にする（間で落ちても、次の next が同じ答えを検証し直すだけ）
             # 鍵はジョブファイルから読まず、プランから分け直した単位とキャッシュから作り直す（外を指させない）
-            if stage == "classify":
+            if stage_kind(stage) == "link":
+                self.cache_put(self.link_key(job["input"]), answer=result)
+                # r2 の入力は r1 の答えから作るので、作り直させる
+                self._link_inputs.pop(("link_r2", job["input"]["target"]["id"]), None)
+            elif stage == "classify":
+                self._nodes = None
                 for uid, labels in result.items():
                     self.cache_put(self.classify_key(job["variant"], self.units[self.pos[uid]]), labels)
             else:
+                self._nodes = None
                 unit = self.units[self.pos[job["input"]["unit"]["uid"]]]
                 a, b = self.classified(unit)
                 if a is None or b is None:
@@ -1059,9 +1464,14 @@ class Round:
         if n > MAX_RETRIES:
             # 人間が理由を読むための記録を書き足してから failed にする（数えるのはジョブの status）。
             # 1行1件の JSON は ensure_ascii で書く（U+2028 などで行が割れないように）
-            units = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
-                     else [job["input"]["unit"]["uid"]])
-            rec = {"job_id": job["job_id"], "stage": stage, "units": units, "errors": job["previous_errors"]}
+            # units は「ノードの無い単位」。根拠付けの失敗ではノードを消さないので空にし、決定を decision に書く
+            rec = {"job_id": job["job_id"], "stage": stage}
+            if stage_kind(stage) == "link":
+                rec.update({"units": [], "decision": job["input"]["target"]["id"]})
+            else:
+                rec["units"] = ([u["uid"] for u in job["input"]["units"]] if stage == "classify"
+                                else [job["input"]["unit"]["uid"]])
+            rec["errors"] = job["previous_errors"]
             path_f = self.work / "failed_jobs.jsonl"
             try:
                 old = read_regular(path_f) if os.path.lexists(str(path_f)) else b""
@@ -1076,8 +1486,8 @@ class Round:
     # --- 波 ---------------------------------------------------------------
 
     @staticmethod
-    def bundles(jobs):
-        """pending のジョブを束にする。A と B は別の束にし、交互に並べる。"""
+    def bundles(jobs, max_chars=BUNDLE_MAX_CHARS, max_jobs=BUNDLE_MAX_JOBS):
+        """pending のジョブを束にする。A と B は別の束にし、交互に並べる。上限は段ごとに渡す（bundle_limits）。"""
         groups = {}
         for job in jobs:
             groups.setdefault(job.get("variant", ""), []).append(job)
@@ -1087,7 +1497,7 @@ class Round:
             cur, size = [], 0
             for job in groups[variant]:
                 n = len(dumps(job))
-                if cur and (size + n > BUNDLE_MAX_CHARS or len(cur) >= BUNDLE_MAX_JOBS):
+                if cur and (size + n > max_chars or len(cur) >= max_jobs):
                     out.append(cur)
                     cur, size = [], 0
                 cur.append(job)
@@ -1103,13 +1513,13 @@ class Round:
         return mixed
 
     def emit(self, stage, pending):
-        chosen = self.bundles(pending)[:PARALLEL]
+        chosen = self.bundles(pending, *bundle_limits(stage))[:PARALLEL]
         wave = []
         for k, bundle in enumerate(chosen, start=1):
             for job in bundle:
                 job["status"] = "issued"
                 write_json(self.job_path(stage, job["job_id"]), job)
-            wave.append({"bundle_id": "b%03d" % k, "agent": "pace:" + STAGE_AGENT[stage],
+            wave.append({"bundle_id": "b%03d" % k, "agent": "pace:" + STAGE_AGENT[stage_kind(stage)],
                          "jobs": [str(self.job_path(stage, job["job_id"]).absolute()) for job in bundle]})
         write_json(self.work / "pending.json", {"bundles": wave})
         lines = []
@@ -1163,7 +1573,12 @@ class Round:
         for stage in JOB_STAGES:
             ids = self.created(stage, rid)
             if ids is None:
-                jobs = self.make_classify(rid) if stage == "classify" else self.make_adjudicate(rid)
+                if stage == "classify":
+                    jobs = self.make_classify(rid)
+                elif stage == "adjudicate":
+                    jobs = self.make_adjudicate(rid)
+                else:
+                    jobs = self.make_link(stage, rid)
                 ids = self.write_stage(stage, rid, jobs)
             pending = []
             waiting = False
@@ -1178,8 +1593,9 @@ class Round:
             if waiting:
                 # 出したジョブの答えを待っている（判定のあとなので、ここには来ない見込み）
                 raise PaceError("答えを待っているジョブがあります。束を subagent に渡してから打ってください")
-        # (3) 全部の段を通った。網羅を確かめてノード化する
-        nodes = self.nodes()
+        # (3) 全部の段を通った。網羅（ノードと根拠付け）を確かめてノードを書く
+        nodes = self.node_list()
+        self.check_link_coverage()
         write_atomic(self.work / "nodes.jsonl",
                      "".join(json.dumps(n, ensure_ascii=False) + "\n" for n in nodes).encode("utf-8"),
                      PRIVATE_FILE)

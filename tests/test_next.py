@@ -60,13 +60,24 @@ def premise(text="前提", ptype="fact"):
     return {"kind": "premise", "ptype": ptype, "text": text}
 
 
+def link_answer(job):
+    """根拠付けの、検証を通る最小の答え（足りない前提1つから決定を導く）。"""
+    return {"claims": [], "gaps": [{"id": "g1", "ptype": "fact", "text": "足りない前提"}],
+            "steps": [{"from": ["g1"], "to": job["input"]["target"]["id"], "warrant": "理由"}], "need": []}
+
+
 def answer_all(bundles, labels_for=None):
-    """束の全ジョブに、検証を通る答えを書く。labels_for(stage, variant, uid) でラベルを選ぶ。"""
+    """束の全ジョブに、検証を通る答えを書く。labels_for(stage, variant, uid) でラベルを選ぶ。
+
+    根拠付けのジョブには link_answer を書く（根拠付けの中身は tests/test_link.py で確かめる）。
+    """
     labels_for = labels_for or (lambda stage, variant, uid: [decision()])
     for _, _, paths in bundles:
         for p in paths:
             job = json.loads(Path(p).read_text(encoding="utf-8"))
-            if job["stage"] == "classify":
+            if job["stage"] in ("link_r1", "link_r2"):
+                ans = link_answer(job)
+            elif job["stage"] == "classify":
                 ans = {"units": [{"uid": u["uid"], "labels": labels_for("classify", job["variant"], u["uid"])}
                                  for u in job["input"]["units"]]}
             else:
@@ -97,6 +108,13 @@ class NextTest(unittest.TestCase):
 
     def units(self):
         return [json.loads(x) for x in (self.work / "units.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    def labels_cache(self):
+        """分類か裁定の答え（labels を持つキャッシュ）の1件目。根拠付けの答え（answer）は選ばない。"""
+        for p in sorted((self.work / "cache").glob("*.json")):
+            if "labels" in json.loads(p.read_text(encoding="utf-8")):
+                return p
+        self.fail("分類の答えのキャッシュがありません")
 
     def drive(self, labels_for=None, limit=20):
         """DONE まで、毎回の波に答えを書いて回す。最後の行を返す。"""
@@ -372,7 +390,8 @@ class NextTest(unittest.TestCase):
         # 裁定を答えずに4回打って失敗させる
         for _ in range(4):
             self.next()
-        self.assertIn("failed_jobs=1", self.next().stdout)
+        # 裁定の失敗のあとは根拠付けの波が出て、尽きると failed_jobs=1 で DONE になる
+        self.assertIn("failed_jobs=1", self.drive())
         self.init()
         bundles, last = parse(self.next().stdout)
         self.assertEqual([a for _, a, _ in bundles], ["pace:pace-judge"])
@@ -427,7 +446,7 @@ class NextTest(unittest.TestCase):
         self.init()
         self.drive()
         # キャッシュを1件消してから、作り終えた印のある段のまま打ち直す
-        victim = sorted((self.work / "cache").glob("*.json"))[0]
+        victim = self.labels_cache()
         victim.unlink()
         r = self.next(ok=False)
         self.assertEqual(r.returncode, 1)
@@ -502,7 +521,7 @@ class NextTest(unittest.TestCase):
                 self.setUp()
                 self.init()
                 self.drive()
-                victim = sorted((self.work / "cache").glob("*.json"))[0]
+                victim = self.labels_cache()
                 victim.write_text(text, encoding="utf-8")
                 self.init()
                 r = self.next()
@@ -537,8 +556,10 @@ class NextTest(unittest.TestCase):
         self.drive(labels)
         for p in (self.work / "cache").glob("*.json"):
             obj = json.loads(p.read_text(encoding="utf-8"))
-            self.assertEqual(set(obj), {"labels"})
-            self.assertTrue(all(set(x) == {"kind", "text", "alternatives"} for x in obj["labels"]))
+            # 分類と裁定は labels、根拠付けは answer のどちらか1つだけを持つ
+            self.assertIn(set(obj), ({"labels"}, {"answer"}))
+            if "labels" in obj:
+                self.assertTrue(all(set(x) == {"kind", "text", "alternatives"} for x in obj["labels"]))
             self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600)
         for name in ("pending.json", "nodes.jsonl"):
             self.assertEqual(stat.S_IMODE((self.work / name).stat().st_mode), 0o600, name)
